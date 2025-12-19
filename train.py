@@ -11,7 +11,10 @@ import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from typing import Dict, Optional, Tuple, Any
 import numpy as np
 from datetime import datetime
@@ -24,7 +27,7 @@ import math
 from multimodal_jscc import MultimodalJSCC
 from losses import MultimodalLoss
 from metrics import calculate_multimodal_metrics
-from data_loader import MultimodalDataLoader, MultimodalDataset
+from data_loader import MultimodalDataLoader, MultimodalDataset, collate_multimodal_batch
 
 # 从本地模块导入配置和工具函数
 from config import TrainingConfig
@@ -130,6 +133,12 @@ def create_scheduler(optimizer, config: TrainingConfig):
     return scheduler
 
 
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    if isinstance(model, (nn.DataParallel, DDP)):
+        return model.module
+    return model
+
+
 def train_one_epoch(
     model: MultimodalJSCC,
     train_loader: DataLoader,
@@ -186,7 +195,7 @@ def train_one_epoch(
         # 优化：只在需要时重置（视频/序列模型）
         #if hasattr(model, 'reset_hidden_states'):
             #model.reset_hidden_states()
-        real_model = model.module if isinstance(model, nn.DataParallel) else model
+        real_model = unwrap_model(model)
         if hasattr(real_model, 'reset_hidden_states'):
             real_model.reset_hidden_states()
         
@@ -466,7 +475,7 @@ def validate(
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
             #model.reset_hidden_states()
-            real_model = model.module if isinstance(model, nn.DataParallel) else model
+            real_model = unwrap_model(model)
             real_model.reset_hidden_states()
             start_time = time.time()
             inputs = batch['inputs']
@@ -519,6 +528,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=None, help='训练轮数')
     parser.add_argument('--max-samples', type=int, default=None, help='最大训练样本数（用于快速训练，None表示使用全部数据）')
     parser.add_argument('--max-val-samples', type=int, default=None, help='最大验证样本数（None表示使用全部数据）')
+    parser.add_argument('--local-rank', type=int, default=None, help='分布式训练的本地进程rank')
+    parser.add_argument('--distributed', action='store_true', help='启用分布式训练')
     args = parser.parse_args()
     
     # 设置随机种子
@@ -527,6 +538,21 @@ def main():
     # 创建配置
     config = TrainingConfig()
     config.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    local_rank = args.local_rank
+    if local_rank is None and "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    is_distributed = args.distributed or world_size > 1 or local_rank is not None
+    if is_distributed:
+        if local_rank is None:
+            local_rank = 0
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        config.device = torch.device("cuda", local_rank)
+        is_main_process = dist.get_rank() == 0
+    else:
+        is_main_process = True
     
     # 更新配置
     config.data_dir = args.data_dir
@@ -547,18 +573,21 @@ def main():
     if args.epochs:
         config.num_epochs = args.epochs
     
-    # 创建日志目录
-    makedirs(config.save_dir)
-    makedirs(config.log_dir)
-    
     # 配置日志
-    log_config = type('LogConfig', (), {
-        'workdir': config.log_dir,
-        'log': config.log_file,
-        'samples': os.path.join(config.save_dir, 'samples'),
-        'models': os.path.join(config.save_dir, 'models')
-    })()
-    logger = logger_configuration(log_config, save_log=True)
+    if is_main_process:
+        makedirs(config.save_dir)
+        makedirs(config.log_dir)
+        log_config = type('LogConfig', (), {
+            'workdir': config.log_dir,
+            'log': config.log_file,
+            'samples': os.path.join(config.save_dir, 'samples'),
+            'models': os.path.join(config.save_dir, 'models')
+        })()
+        logger = logger_configuration(log_config, save_log=True)
+    else:
+        logger = logging.getLogger('multimodal_jscc')
+        logger.addHandler(logging.NullHandler())
+        logger.disabled = True
     
     logger.info("=" * 80)
     logger.info("多模态JSCC训练脚本")
@@ -608,8 +637,10 @@ def main():
     logger.info("创建模型...")
     model = create_model(config)
     model = model.to(config.device)
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     config.print_config(logger)
-    print_model_structure_info(model, logger)
+    print_model_structure_info(unwrap_model(model), logger)
     #if args.resume:
         #logger.info(f"从检查点恢复: {args.resume}")
         #checkpoint = torch.load(args.resume, map_location=config.device)
@@ -651,6 +682,8 @@ def main():
             n_layers=3
         )
         discriminator = discriminator.to(config.device)
+        if is_distributed:
+            discriminator = DDP(discriminator, device_ids=[local_rank], output_device=local_rank)
         optimizer_d = optim.Adam(
             discriminator.parameters(),
             lr=config.learning_rate,
@@ -686,13 +719,49 @@ def main():
     
     # 创建训练数据集和加载器
     train_dataset = data_loader_manager.create_dataset(train_data_list)
-    train_loader = data_loader_manager.create_dataloader(train_dataset, shuffle=True)
+    train_sampler = None
+    if is_distributed:
+        train_sampler = DistributedSampler(train_dataset)
+        actual_prefetch_factor = getattr(data_loader_manager, 'prefetch_factor', 2)
+        if data_loader_manager.num_workers == 0:
+            actual_prefetch_factor = None
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            sampler=train_sampler,
+            shuffle=False,
+            num_workers=data_loader_manager.num_workers,
+            collate_fn=collate_multimodal_batch,
+            pin_memory=True,
+            prefetch_factor=actual_prefetch_factor,
+            persistent_workers=True if data_loader_manager.num_workers > 0 else False
+        )
+    else:
+        train_loader = data_loader_manager.create_dataloader(train_dataset, shuffle=True)
     
     # 创建验证数据集和加载器
     val_loader = None
+    val_sampler = None
     if val_data_list:
         val_dataset = data_loader_manager.create_dataset(val_data_list)
-        val_loader = data_loader_manager.create_dataloader(val_dataset, shuffle=False)
+        if is_distributed:
+            val_sampler = DistributedSampler(val_dataset, shuffle=False)
+            actual_prefetch_factor = getattr(data_loader_manager, 'prefetch_factor', 2)
+            if data_loader_manager.num_workers == 0:
+                actual_prefetch_factor = None
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=config.batch_size,
+                sampler=val_sampler,
+                shuffle=False,
+                num_workers=data_loader_manager.num_workers,
+                collate_fn=collate_multimodal_batch,
+                pin_memory=True,
+                prefetch_factor=actual_prefetch_factor,
+                persistent_workers=True if data_loader_manager.num_workers > 0 else False
+            )
+        else:
+            val_loader = data_loader_manager.create_dataloader(val_dataset, shuffle=False)
     
     # 恢复训练（如果指定）
     start_epoch = 0
@@ -702,21 +771,17 @@ def main():
         logger.info(f"从检查点恢复: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=config.device)
         state_dict = checkpoint['model_state_dict']
-        if not check_state_dict_compatibility(model, state_dict, logger):
+        model_to_load = unwrap_model(model)
+        if not check_state_dict_compatibility(model_to_load, state_dict, logger):
             logger.error("!!! 维度不匹配，拒绝加载 Checkpoint !!!")
             sys.exit(1)
-        model.load_state_dict(state_dict)
+        model_to_load.load_state_dict(state_dict)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if scheduler and 'scheduler_state_dict' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         logger.info(f"从epoch {start_epoch}恢复训练")
-        if torch.cuda.device_count() > 1:
-            logger.info(f"检测到 {torch.cuda.device_count()} 张显卡，启用多卡并行训练！")
-            model = nn.DataParallel(model)
-            if discriminator is not None:
-                discriminator = nn.DataParallel(discriminator)
         #model.load_state_dict(checkpoint['model_state_dict'])
         #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         #if scheduler and 'scheduler_state_dict' in checkpoint:
@@ -755,6 +820,8 @@ def main():
     
     for epoch in range(start_epoch, config.num_epochs):
         logger.info(f"\nEpoch {epoch + 1}/{config.num_epochs}")
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         
         # 训练
         train_metrics = train_one_epoch(
@@ -786,6 +853,8 @@ def main():
         
         # 验证
         if val_loader is not None and (epoch + 1) % config.val_freq == 0:
+            if val_sampler is not None:
+                val_sampler.set_epoch(epoch)
             logger.info("开始验证...")
             val_metrics = validate(
                 model=model,
@@ -812,9 +881,9 @@ def main():
                 logger.info(f"视频平均 PSNR: {val_metrics['video_psnr_mean']:.2f} dB")
             if 'text_bleu' in val_metrics:
                 logger.info(f"文本 BLEU: {val_metrics['text_bleu']:.4f}")
-            model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+            model_to_save = unwrap_model(model)
             # 保存最佳模型
-            if val_metrics['loss'] < best_val_loss:
+            if is_main_process and val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
                 best_model_path = os.path.join(config.save_dir, 'best_model.pth')
                 checkpoint = {
@@ -831,7 +900,7 @@ def main():
                 logger.info(f"保存最佳模型到: {best_model_path}")
         
         # 定期保存检查点
-        if (epoch + 1) % config.save_freq == 0:
+        if is_main_process and (epoch + 1) % config.save_freq == 0:
             checkpoint_path = os.path.join(config.save_dir, f'checkpoint_epoch_{epoch + 1}.pth')
             checkpoint = {
                 'epoch': epoch,
@@ -849,6 +918,8 @@ def main():
     logger.info("训练完成！")
     logger.info(f"最佳验证损失: {best_val_loss:.4f}")
     logger.info(f"模型保存在: {config.save_dir}")
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
