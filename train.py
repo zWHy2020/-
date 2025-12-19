@@ -234,7 +234,8 @@ def train_one_epoch(
         # 移除torch.cuda.empty_cache()以提升训练速度
         
         # 前向传播（使用混合精度）
-        with torch.amp.autocast('cuda', enabled=config.use_amp):
+        use_amp = config.use_amp and device.type == "cuda"
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             results = model(
                 text_input=text_input,
                 image_input=image_input,
@@ -292,7 +293,7 @@ def train_one_epoch(
         if discriminator is not None and optimizer_d is not None:
             disc_loss_real = torch.tensor(0.0, device=device)
             disc_loss_fake = torch.tensor(0.0, device=device)
-            with torch.amp.autocast('cuda', enabled=config.use_amp):
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 if 'image' in device_targets:
                     real_img_pred, _ = discriminator(image=device_targets['image'])
                     if adv_loss_fn is None:
@@ -340,16 +341,20 @@ def train_one_epoch(
                         logger.warning(f"批次 {batch_idx + 1}: 检测到无效梯度，手动跳过更新")
                         skip_update_manual = True
        
-            if scaler is not None:
-                scaler.step(optimizer)
-                #scaler.update()
+            if skip_update_manual:
+                optimizer.zero_grad()
+                if discriminator is not None and optimizer_d is not None:
+                    optimizer_d.zero_grad()
             else:
-                optimizer.step()
+                if scaler is not None:
+                    scaler.step(optimizer)
+                else:
+                    optimizer.step()
             optimizer.zero_grad()
  
             
             # 【Phase 3】训练判别器（如果启用对抗训练）
-            if discriminator is not None and optimizer_d is not None:
+            if not skip_update_manual and discriminator is not None and optimizer_d is not None:
                 if config.grad_clip_norm > 0:
                     if scaler is not None:
                         scaler.unscale_(optimizer_d)
@@ -476,7 +481,8 @@ def validate(
         for batch_idx, batch in enumerate(val_loader):
             #model.reset_hidden_states()
             real_model = unwrap_model(model)
-            real_model.reset_hidden_states()
+            if hasattr(real_model, 'reset_hidden_states'):
+                real_model.reset_hidden_states()
             start_time = time.time()
             inputs = batch['inputs']
             targets = batch['targets']
@@ -492,7 +498,8 @@ def validate(
             for key, value in targets.items():
                 if value is not None:
                     device_targets[key] = value.to(device, non_blocking=True)
-            with torch.amp.autocast('cuda', enabled=config.use_amp):
+            use_amp = config.use_amp and device.type == "cuda"
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 results = model(
                     text_input=text_input,
                     image_input=image_input,
@@ -513,6 +520,16 @@ def validate(
                 meters['image_psnr'].update(batch_psnr, n=inputs['image_input'].size(0))
             meters['time'].update(time.time() - start_time)
             del results, loss_dict, device_targets
+
+        if dist.is_initialized():
+            for meter in meters.values():
+                stats = torch.tensor([meter.sum, meter.count], device=device)
+                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                meter.sum = stats[0].item()
+                meter.count = int(stats[1].item())
+                meter.avg = meter.sum / meter.count if meter.count > 0 else 0
+                meter.val = meter.avg
+
         avg_metrics = {key: meter.avg for key, meter in meters.items()}
         return avg_metrics
 
@@ -638,7 +655,12 @@ def main():
     model = create_model(config)
     model = model.to(config.device)
     if is_distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=getattr(config, 'ddp_find_unused_parameters', True)
+        )
     config.print_config(logger)
     print_model_structure_info(unwrap_model(model), logger)
     #if args.resume:
@@ -683,7 +705,12 @@ def main():
         )
         discriminator = discriminator.to(config.device)
         if is_distributed:
-            discriminator = DDP(discriminator, device_ids=[local_rank], output_device=local_rank)
+            discriminator = DDP(
+                discriminator,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=getattr(config, 'ddp_find_unused_parameters', True)
+            )
         optimizer_d = optim.Adam(
             discriminator.parameters(),
             lr=config.learning_rate,
@@ -700,9 +727,11 @@ def main():
     
     # 创建混合精度训练的scaler（如果启用）
     scaler = None
-    if config.use_amp:
+    if config.use_amp and config.device.type == "cuda":
         scaler = torch.amp.GradScaler('cuda')  # 修复：使用新的API，避免FutureWarning
         logger.info("启用混合精度训练（AMP）")
+    elif config.use_amp:
+        logger.warning("检测到非CUDA设备，已禁用混合精度训练（AMP）。")
     
     # 创建数据加载器
     logger.info("创建数据加载器...")
@@ -822,6 +851,7 @@ def main():
         logger.info(f"\nEpoch {epoch + 1}/{config.num_epochs}")
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
+        model_to_save = unwrap_model(model)
         
         # 训练
         train_metrics = train_one_epoch(
@@ -881,7 +911,6 @@ def main():
                 logger.info(f"视频平均 PSNR: {val_metrics['video_psnr_mean']:.2f} dB")
             if 'text_bleu' in val_metrics:
                 logger.info(f"文本 BLEU: {val_metrics['text_bleu']:.4f}")
-            model_to_save = unwrap_model(model)
             # 保存最佳模型
             if is_main_process and val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']

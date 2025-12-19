@@ -106,6 +106,7 @@ class TrainingConfig:
         # 【Phase 3】对抗训练参数
         self.use_adversarial = False  # 是否使用对抗训练（默认关闭，需要时可启用）
         self.discriminator_weight = 0.01  # 【Phase 4】对抗损失权重（默认较小）
+        self.ddp_find_unused_parameters = True  # DDP下允许未使用参数（用于缺失模态场景）
     def print_config(self, logger=None):
         log_func = logger.info if logger else print
         log_func("\n=== 当前生效的配置 (TrainingConfig) ===")
