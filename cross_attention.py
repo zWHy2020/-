@@ -153,7 +153,7 @@ class CrossAttentionFusion(nn.Module):
     def __init__(
         self,
         embed_dim: int,
-        fusion_type: str = "gated",  # "add", "gated", "residual"
+        fusion_type: str = "gated",  # "add", "gated", "residual", "confidence"
         dropout: float = 0.1
     ):
         super().__init__()
@@ -167,6 +167,13 @@ class CrossAttentionFusion(nn.Module):
                 nn.Sigmoid()
             )
             self.proj = nn.Linear(embed_dim * 2, embed_dim)
+        elif fusion_type == "confidence":
+            # 置信度融合（动态权重）
+            self.confidence_head = nn.Sequential(
+                nn.Linear(embed_dim * 2, embed_dim),
+                nn.ReLU(),
+                nn.Linear(embed_dim, 2)
+            )
         elif fusion_type == "residual":
             # 残差连接
             self.norm = nn.LayerNorm(embed_dim)
@@ -203,6 +210,15 @@ class CrossAttentionFusion(nn.Module):
             gate = self.gate(concat_features)
             projected = self.proj(concat_features)
             output = gate * projected + (1 - gate) * original_features
+
+        elif self.fusion_type == "confidence":
+            # 置信度融合
+            concat_features = torch.cat([original_features, cross_attn_output], dim=-1)
+            logits = self.confidence_head(concat_features)
+            weights = F.softmax(logits, dim=-1)
+            original_weight = weights[..., 0:1]
+            cross_weight = weights[..., 1:2]
+            output = original_weight * original_features + cross_weight * cross_attn_output
             
         elif self.fusion_type == "residual":
             # 残差连接

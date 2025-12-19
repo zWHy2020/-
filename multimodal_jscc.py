@@ -60,6 +60,8 @@ class MultimodalJSCC(nn.Module):
         channel_type: str = "awgn",
         snr_db: float = 10.0,
         power_normalization: bool = True,
+        use_quantization_noise: bool = False,
+        quantization_noise_range: float = 0.5,
         
         # 训练参数
     ):
@@ -145,6 +147,8 @@ class MultimodalJSCC(nn.Module):
             snr_db=snr_db,
             power_normalization=power_normalization
         )
+        self.use_quantization_noise = use_quantization_noise
+        self.quantization_noise_range = quantization_noise_range
         
         # 功率归一化
         #self.power_normalizer = nn.ModuleDict({
@@ -216,7 +220,7 @@ class MultimodalJSCC(nn.Module):
                 )
             
             # 调用编码器
-            image_encoded, image_guide = self.image_encoder(image_input)
+            image_encoded, image_guide = self.image_encoder(image_input, snr_db=snr_db)
             
             # 编码后形状验证
             patch_size = None
@@ -247,7 +251,7 @@ class MultimodalJSCC(nn.Module):
         
         # 视频编码
         if video_input is not None:
-            video_encoded, video_guide = self.video_encoder(video_input)
+            video_encoded, video_guide = self.video_encoder(video_input, snr_db=snr_db)
             # 验证输出维度
             #expected_video_dim = getattr(self.power_normalizer['video'], 'normalized_shape', (None,))
             #expected_video_dim = expected_video_dim[0] if isinstance(expected_video_dim, (list, tuple)) else expected_video_dim
@@ -276,8 +280,13 @@ class MultimodalJSCC(nn.Module):
         # 信道传输
         transmitted_features = {}
         for modality, features in encoded_features.items():
+            features = self._apply_quantization_noise(features)
             transmitted_features[modality] = self.channel(features)
             results[f'{modality}_transmitted'] = transmitted_features[modality]
+        results['rate_stats'] = {
+            modality: features.pow(2).mean()
+            for modality, features in encoded_features.items()
+        }
         
         # 解码阶段 - 语义引导式解码
         decoded_outputs = {}
@@ -315,6 +324,17 @@ class MultimodalJSCC(nn.Module):
         
         results.update(decoded_outputs)
         return results
+
+    def _apply_quantization_noise(self, features: torch.Tensor) -> torch.Tensor:
+        if not self.use_quantization_noise or not self.training:
+            return features
+        if self.quantization_noise_range <= 0:
+            return features
+        noise = torch.empty_like(features).uniform_(
+            -self.quantization_noise_range,
+            self.quantization_noise_range
+        )
+        return features + noise
     
     def _validate_input(self, input_tensor: Optional[torch.Tensor], modality: str) -> Optional[torch.Tensor]:
         """
@@ -389,13 +409,13 @@ class MultimodalJSCC(nn.Module):
         
         # 图像编码
         if image_input is not None:
-            image_encoded, image_guide = self.image_encoder(image_input,snr_db=snr_db)
+            image_encoded, image_guide = self.image_encoder(image_input, snr_db=snr_db)
             results['image_encoded'] = image_encoded
             results['image_guide'] = image_guide
         
         # 视频编码
         if video_input is not None:
-            video_encoded, video_guide = self.video_encoder(video_input)
+            video_encoded, video_guide = self.video_encoder(video_input, snr_db=snr_db)
             results['video_encoded'] = video_encoded
             results['video_guide'] = video_guide
         
@@ -478,4 +498,3 @@ class MultimodalJSCC(nn.Module):
             'trainable_parameters': trainable_params,
             'model_size_mb': total_params * 4 / (1024 * 1024),  # 假设float32
         }
-

@@ -237,7 +237,13 @@ class TextImageContrastiveLoss(nn.Module):
             torch.Tensor: 对比损失值
         """
         # 处理图像特征：如果是序列，使用全局平均池化
-        if reconstructed_image_features.dim() == 3:
+        if reconstructed_image_features.dim() == 5:
+            # [B, T, C, H, W] -> [B, C]
+            img_features = reconstructed_image_features.mean(dim=(1, 3, 4))
+        elif reconstructed_image_features.dim() == 4:
+            # [B, C, H, W] -> [B, C]
+            img_features = reconstructed_image_features.mean(dim=(2, 3))
+        elif reconstructed_image_features.dim() == 3:
             # [B, L, C] -> [B, C]
             img_features = reconstructed_image_features.mean(dim=1)
         else:
@@ -535,6 +541,7 @@ class VideoLoss(nn.Module):
         reconstruction_weight: float = 1.0, 
         perceptual_weight: float = 0.0,  # 默认禁用
         temporal_weight: float = 0.1,
+        temporal_consistency_weight: float = 0.0,
         data_range: float = 1.0
 
     ):
@@ -542,6 +549,7 @@ class VideoLoss(nn.Module):
         self.recon_weight = reconstruction_weight
         self.percep_weight = 0.0  # 强制设为0，不再使用MS-SSIM
         self.temp_weight = temporal_weight
+        self.consistency_weight = temporal_consistency_weight
         self.data_range = data_range
         #self.epsilon = 1e-6
         
@@ -588,17 +596,23 @@ class VideoLoss(nn.Module):
         target_f32 = target.float()
         loss_recon_avg = F.l1_loss(pred_f32, target_f32)
         loss_temp = torch.tensor(0.0, device=pred.device)
+        loss_consistency = torch.tensor(0.0, device=pred.device)
         if pred_f32.size(1) > 1 and self.temp_weight > 0:
             pred_diff = pred_f32[:, 1:] - pred_f32[:, :-1]
             target_diff = target_f32[:, 1:] - target_f32[:, :-1]
             loss_temp = F.l1_loss(pred_diff, target_diff)
+        if pred_f32.size(1) > 1 and self.consistency_weight > 0:
+            pred_diff = pred_f32[:, 1:] - pred_f32[:, :-1]
+            loss_consistency = pred_diff.abs().mean()
         total_loss = (
             (self.recon_weight * loss_recon_avg) +
-            (self.temp_weight * loss_temp)
+            (self.temp_weight * loss_temp) +
+            (self.consistency_weight * loss_consistency)
         )
         return total_loss, {
             'video_recon_loss_l1': loss_recon_avg.item(),
-            'video_temporal_loss_l1': loss_temp.item()
+            'video_temporal_loss_l1': loss_temp.item(),
+            'video_temporal_consistency_loss': loss_consistency.item()
         }
         #diff = pred -target
         #loss_recon_avg= torch.mean(torch.sqrt(diff * diff + self.epsilon))
@@ -716,6 +730,9 @@ class MultimodalLoss(nn.Module):
         perceptual_weight: float = 0.1,
         temporal_weight: float = 0.1,
         text_contrastive_weight: float = 0.1,  # 【新增】文本对比损失权重
+        video_text_contrastive_weight: float = 0.05,  # 【新增】视频-文本对比损失权重
+        rate_weight: float = 1e-4,  # 【新增】码率/能量约束权重
+        temporal_consistency_weight: float = 0.0,  # 【新增】视频时序一致性正则权重
         discriminator_weight: float = 0.01,  # 【Phase 3】对抗损失权重（默认较小）
         
         # 假设数据范围是 [0, 1]
@@ -730,6 +747,8 @@ class MultimodalLoss(nn.Module):
         
         # 【新增】文本对比损失权重
         self.text_contrastive_weight = text_contrastive_weight
+        self.video_text_contrastive_weight = video_text_contrastive_weight
+        self.rate_weight = rate_weight
         
         # 【Phase 3】对抗训练相关
         self.use_adversarial = use_adversarial
@@ -742,6 +761,7 @@ class MultimodalLoss(nn.Module):
             use_contrastive=True,
             contrastive_weight=self.text_contrastive_weight
         )
+        self.video_text_contrastive_loss_fn = TextImageContrastiveLoss()
         
         self.image_loss_fn = ImageLoss(
             reconstruction_weight=reconstruction_weight,
@@ -753,6 +773,7 @@ class MultimodalLoss(nn.Module):
             reconstruction_weight=reconstruction_weight,
             perceptual_weight=perceptual_weight,
             temporal_weight=temporal_weight,
+            temporal_consistency_weight=temporal_consistency_weight,
             data_range=data_range
         )
     
@@ -881,6 +902,36 @@ class MultimodalLoss(nn.Module):
                 loss_dict['video_recon_loss_l1'] = 0.0
                 loss_dict['video_percep_loss_msssim'] = 0.0
                 loss_dict['video_temporal_loss_l1'] = 0.0
+                loss_dict['video_temporal_consistency_loss'] = 0.0
+
+        # --- 视频-文本对比损失 ---
+        if self.video_text_contrastive_weight > 0 and 'video_encoded' in predictions and 'text_encoded' in predictions:
+            try:
+                video_text_loss = self.video_text_contrastive_loss_fn(
+                    predictions['video_encoded'],
+                    predictions['text_encoded']
+                )
+                weighted_video_text_loss = self.video_text_contrastive_weight * video_text_loss
+                total_loss = weighted_video_text_loss if total_loss is None else (total_loss + weighted_video_text_loss)
+                loss_dict['video_text_contrastive_loss'] = weighted_video_text_loss.item()
+            except Exception as e:
+                print(f"警告: 计算视频-文本对比损失时出错: {e}")
+                loss_dict['video_text_contrastive_loss'] = 0.0
+
+        # --- 码率/能量约束 ---
+        if self.rate_weight > 0 and 'rate_stats' in predictions:
+            rate_loss = None
+            try:
+                for value in predictions['rate_stats'].values():
+                    if isinstance(value, torch.Tensor):
+                        rate_loss = value if rate_loss is None else (rate_loss + value)
+                if rate_loss is not None:
+                    weighted_rate_loss = self.rate_weight * rate_loss
+                    total_loss = weighted_rate_loss if total_loss is None else (total_loss + weighted_rate_loss)
+                    loss_dict['rate_loss'] = weighted_rate_loss.item()
+            except Exception as e:
+                print(f"警告: 计算码率损失时出错: {e}")
+                loss_dict['rate_loss'] = 0.0
         
         # 【Phase 3】对抗损失（如果启用）
         if self.use_adversarial and discriminator_outputs is not None:
