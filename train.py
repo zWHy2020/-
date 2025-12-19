@@ -74,7 +74,9 @@ def create_model(config: TrainingConfig) -> MultimodalJSCC:
         video_use_convlstm=config.video_use_convlstm,
         video_output_dim=config.video_output_dim,
         channel_type=config.channel_type,
-        snr_db=config.snr_db
+        snr_db=config.snr_db,
+        use_quantization_noise=getattr(config, 'use_quantization_noise', False),
+        quantization_noise_range=getattr(config, 'quantization_noise_range', 0.5)
     )
     return model
 
@@ -89,6 +91,9 @@ def create_loss_fn(config: TrainingConfig) -> MultimodalLoss:
         perceptual_weight=config.perceptual_weight,
         temporal_weight=config.temporal_weight,
         text_contrastive_weight=getattr(config, 'text_contrastive_weight', 0.1),  # 【新增】文本对比损失权重
+        video_text_contrastive_weight=getattr(config, 'video_text_contrastive_weight', 0.05),  # 【新增】视频-文本对比损失权重
+        rate_weight=getattr(config, 'rate_weight', 1e-4),  # 【新增】码率/能量约束权重
+        temporal_consistency_weight=getattr(config, 'temporal_consistency_weight', 0.02),  # 【新增】视频时序一致性正则权重
         discriminator_weight=getattr(config, 'discriminator_weight', 0.01),  # 【Phase 3】对抗损失权重
         use_adversarial=getattr(config, 'use_adversarial', False),  # 【Phase 3】是否使用对抗训练
         data_range=1.0

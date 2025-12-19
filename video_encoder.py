@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict, Any
 import math
+from image_encoder import SNRModulator
 
 
 class LightweightTemporalConv(nn.Module):
@@ -384,6 +385,7 @@ class VideoJSCCEncoder(nn.Module):
         
         # 特征重塑层
         self.feature_reshape = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
+        self.snr_modulator = SNRModulator(hidden_dim)
         
         # 轻量级时序卷积建模（重构：使用LightweightTemporalConv替代ConvLSTM）
         if use_convlstm:
@@ -415,7 +417,8 @@ class VideoJSCCEncoder(nn.Module):
     def forward(
         self,
         video_frames: torch.Tensor,
-        reset_state: bool = False
+        reset_state: bool = False,
+        snr_db: float = 10.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         视频编码器前向传播 - 特征空间运动补偿
@@ -442,6 +445,7 @@ class VideoJSCCEncoder(nn.Module):
             
             # 使用Swin Transformer提取当前帧特征
             current_feature = self._extract_swin_features(current_frame)
+            current_feature = self.snr_modulator(current_feature, snr_db)
             
             # 特征空间运动补偿
             if self.use_optical_flow and t > 0 and prev_feature is not None:
@@ -470,6 +474,7 @@ class VideoJSCCEncoder(nn.Module):
                     feature_residual, self.hidden_state = self.temporal_layer(
                         feature_residual, self.hidden_state
                     )
+                feature_residual = self.snr_modulator(feature_residual, snr_db)
                 
                 # 输出投影
                 encoded_frame = self.output_proj(feature_residual)
@@ -488,6 +493,7 @@ class VideoJSCCEncoder(nn.Module):
                     current_feature, self.hidden_state = self.temporal_layer(
                         current_feature, self.hidden_state
                     )
+                current_feature = self.snr_modulator(current_feature, snr_db)
                 
                 # 输出投影
                 encoded_frame = self.output_proj(current_feature)
@@ -1054,4 +1060,3 @@ class VideoJSCCDecoder(nn.Module):
     def reset_hidden_state(self):
         """重置隐藏状态"""
         self.hidden_state = None
-

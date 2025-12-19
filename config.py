@@ -58,6 +58,9 @@ class TrainingConfig:
         self.perceptual_weight = 0.01  # 【重构】启用LPIPS感知损失以提升重建质量
         self.temporal_weight = 0.05  # 降低时序损失权重
         self.text_contrastive_weight = 0.1  # 【新增】文本-图像对比损失权重
+        self.video_text_contrastive_weight = 0.05  # 【新增】视频-文本对比损失权重
+        self.rate_weight = 1e-4  # 【新增】码率/能量约束权重
+        self.temporal_consistency_weight = 0.02  # 【新增】视频时序一致性正则权重
         
         # SNR设置
         self.train_snr_min = -5.0  # 训练时SNR范围
@@ -107,6 +110,8 @@ class TrainingConfig:
         self.use_adversarial = False  # 是否使用对抗训练（默认关闭，需要时可启用）
         self.discriminator_weight = 0.01  # 【Phase 4】对抗损失权重（默认较小）
         self.ddp_find_unused_parameters = True  # DDP下允许未使用参数（用于缺失模态场景）
+        self.use_quantization_noise = True  # 【新增】是否启用量化噪声模拟
+        self.quantization_noise_range = 0.5  # 【新增】量化噪声范围（均匀分布 [-r, r]）
     def print_config(self, logger=None):
         log_func = logger.info if logger else print
         log_func("\n=== 当前生效的配置 (TrainingConfig) ===")
