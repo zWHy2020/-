@@ -178,6 +178,10 @@ def train_one_epoch(
         'video_temporal_loss': AverageMeter(),
         'time': AverageMeter()
     }
+
+    # 跳过统计（用于定位NaN/Inf导致的更新缺失）
+    skipped_loss_nan = 0
+    skipped_grad_nan = 0
     
     global_step = epoch * len(train_loader)
     accumulation_steps = config.gradient_accumulation_steps
@@ -285,6 +289,7 @@ def train_one_epoch(
                 logger.warning(f"批次 {batch_idx + 1}: 生成器 Loss NaN/Inf，跳过")
                 # 清理中间变量
                 del results, loss_dict, total_loss
+                skipped_loss_nan += 1
                 continue
             
             # 梯度累积：损失需要除以累积步数
@@ -345,6 +350,8 @@ def train_one_epoch(
                     if torch.isnan(grad_norm) or torch.isinf(grad_norm):
                         logger.warning(f"批次 {batch_idx + 1}: 检测到无效梯度，手动跳过更新")
                         skip_update_manual = True
+            if skip_update_manual:
+                skipped_grad_nan += 1
        
             if skip_update_manual:
                 optimizer.zero_grad()
@@ -443,6 +450,8 @@ def train_one_epoch(
     
     # 返回平均指标
     avg_metrics = {key: meter.avg for key, meter in meters.items()}
+    avg_metrics['skipped_loss_nan'] = skipped_loss_nan
+    avg_metrics['skipped_grad_nan'] = skipped_grad_nan
     return avg_metrics
 
 
@@ -878,6 +887,12 @@ def main():
             f"Loss: {train_metrics['loss']:.4f} | "
             f"Time: {train_metrics['time']:.2f}s"
         )
+        if train_metrics.get('skipped_loss_nan', 0) or train_metrics.get('skipped_grad_nan', 0):
+            logger.info(
+                "跳过统计 | "
+                f"Loss NaN/Inf: {train_metrics.get('skipped_loss_nan', 0)} | "
+                f"Grad NaN/Inf: {train_metrics.get('skipped_grad_nan', 0)}"
+            )
         
         # 更新学习率
         if scheduler:

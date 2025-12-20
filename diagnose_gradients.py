@@ -1,13 +1,13 @@
 """
-逐步排查 NaN/Inf 的诊断脚本。
+梯度诊断脚本：定位反向传播阶段的 NaN/Inf 与异常梯度。
 
-建议按默认顺序运行，逐步定位问题来源：
-1) 检查输入是否含 NaN/Inf
-2) 检查模型输出是否含 NaN/Inf
-3) 检查各项 loss 是否含 NaN/Inf
+功能：
+- 执行单步前向 + loss + backward
+- 检查每一层参数梯度是否包含 NaN/Inf
+- 输出异常梯度的参数名、统计信息（min/max/mean/norm）
 
 用法示例：
-  python diagnose_nan_pipeline.py --data-dir /path/to/data \
+  python diagnose_gradients.py --data-dir /path/to/data \
     --manifest /path/to/train_manifest.json --max-batches 5 --batch-size 1
 
 可选开关：
@@ -17,7 +17,7 @@
 """
 import argparse
 import json
-from typing import Dict, Any, List, Iterable
+from typing import Dict, Any, List
 
 import torch
 
@@ -43,36 +43,8 @@ def _summarize_tensor(tensor: torch.Tensor) -> str:
     return (
         f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
         f"min={tensor.min().item():.4e} max={tensor.max().item():.4e} "
-        f"mean={tensor.mean().item():.4e}"
+        f"mean={tensor.mean().item():.4e} norm={tensor.norm().item():.4e}"
     )
-
-
-def _check_tensors(label: str, tensors: Dict[str, Any]) -> bool:
-    """Return True if any NaN/Inf is found."""
-    has_issue = False
-    for name, value in tensors.items():
-        if value is None:
-            continue
-        if isinstance(value, dict):
-            if _check_tensors(f"{label}.{name}", value):
-                has_issue = True
-            continue
-        if not isinstance(value, torch.Tensor):
-            continue
-        if _tensor_has_nan_or_inf(value):
-            print(f"[NaN/Inf] {label}.{name}: {_summarize_tensor(value)}")
-            has_issue = True
-    return has_issue
-
-
-def _collect_inputs(batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-    inputs = batch.get("inputs", {})
-    return {
-        "text_input": inputs.get("text_input"),
-        "text_attention_mask": inputs.get("text_attention_mask"),
-        "image_input": inputs.get("image_input"),
-        "video_input": inputs.get("video_input"),
-    }
 
 
 def _apply_skip_modalities(
@@ -144,7 +116,7 @@ def _build_loss_fn(config: TrainingConfig, device: torch.device) -> MultimodalLo
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="逐步排查 NaN/Inf 的诊断脚本")
+    parser = argparse.ArgumentParser(description="梯度诊断脚本")
     parser.add_argument("--data-dir", required=True, help="数据目录")
     parser.add_argument("--manifest", required=True, help="manifest JSON 路径")
     parser.add_argument("--batch-size", type=int, default=1, help="批次大小")
@@ -194,24 +166,25 @@ def main() -> None:
     loss_fn = _build_loss_fn(config, device)
     if args.disable_msssim and hasattr(loss_fn, "image_loss_fn"):
         loss_fn.image_loss_fn.msssim_weight = 0.0
-    model.eval()
 
-    print("=== 诊断开始 ===")
+    model.train()
+
+    print("=== 梯度诊断开始 ===")
     print(f"device: {device}")
     print(f"batch_size: {args.batch_size} | max_batches: {args.max_batches}")
     print(f"skip_text={args.skip_text} skip_image={args.skip_image} skip_video={args.skip_video}")
-    print(
-        "loss flags: "
-        f"quant_noise={not args.disable_quant_noise} "
-        f"perceptual={not args.disable_perceptual} "
-        f"text_contrastive={not args.disable_text_contrastive} "
-        f"video_text_contrastive={not args.disable_video_text_contrastive}"
-    )
 
     for batch_idx, batch in enumerate(loader, start=1):
-        inputs = _collect_inputs(batch)
+        inputs = batch.get("inputs", {})
         targets = batch.get("targets", {}).copy()
         attention_mask = batch.get("attention_mask", None)
+
+        inputs = {
+            "text_input": inputs.get("text_input"),
+            "text_attention_mask": inputs.get("text_attention_mask"),
+            "image_input": inputs.get("image_input"),
+            "video_input": inputs.get("video_input"),
+        }
 
         _apply_skip_modalities(
             inputs,
@@ -221,7 +194,6 @@ def main() -> None:
             skip_video=args.skip_video,
         )
 
-        # move to device
         if inputs.get("text_input") is not None:
             inputs["text_input"] = inputs["text_input"].to(device)
         if inputs.get("text_attention_mask") is not None:
@@ -235,35 +207,37 @@ def main() -> None:
             key: value.to(device) for key, value in targets.items() if value is not None
         }
 
-        # 1) 输入检查
-        if _check_tensors(f"batch{batch_idx}.inputs", inputs):
-            print(f"[停止] 输入已出现 NaN/Inf，batch={batch_idx}")
+        model.zero_grad(set_to_none=True)
+        results = model(
+            text_input=inputs.get("text_input"),
+            image_input=inputs.get("image_input"),
+            video_input=inputs.get("video_input"),
+            text_attention_mask=inputs.get("text_attention_mask"),
+            snr_db=config.snr_db,
+        )
+        loss_dict = loss_fn(
+            predictions=results,
+            targets=device_targets,
+            attention_mask=inputs.get("text_attention_mask"),
+        )
+        total_loss = loss_dict["total_loss"]
+
+        if _tensor_has_nan_or_inf(total_loss):
+            print(f"[NaN/Inf] loss 在 batch {batch_idx} 出现异常: {_summarize_tensor(total_loss)}")
             break
 
-        # 2) 模型前向
-        with torch.no_grad():
-            results = model(
-                text_input=inputs.get("text_input"),
-                image_input=inputs.get("image_input"),
-                video_input=inputs.get("video_input"),
-                text_attention_mask=inputs.get("text_attention_mask"),
-                snr_db=config.snr_db,
-            )
+        total_loss.backward()
 
-        if _check_tensors(f"batch{batch_idx}.outputs", results):
-            print(f"[停止] 输出已出现 NaN/Inf，batch={batch_idx}")
-            break
+        nan_params = []
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                continue
+            if _tensor_has_nan_or_inf(param.grad):
+                nan_params.append(name)
+                print(f"[NaN/Inf] grad: {name} -> {_summarize_tensor(param.grad)}")
 
-        # 3) loss 检查
-        with torch.no_grad():
-            loss_dict = loss_fn(
-                predictions=results,
-                targets=device_targets,
-                attention_mask=inputs.get("text_attention_mask"),
-            )
-
-        if _check_tensors(f"batch{batch_idx}.loss", loss_dict):
-            print(f"[停止] loss 已出现 NaN/Inf，batch={batch_idx}")
+        if nan_params:
+            print(f"[停止] batch {batch_idx} 出现异常梯度，参数数={len(nan_params)}")
             break
 
         print(f"batch {batch_idx}: OK")
@@ -271,7 +245,7 @@ def main() -> None:
         if batch_idx >= args.max_batches:
             break
 
-    print("=== 诊断结束 ===")
+    print("=== 梯度诊断结束 ===")
 
 
 if __name__ == "__main__":
