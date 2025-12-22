@@ -107,7 +107,7 @@ class AWGNChannel(nn.Module):
     def _power_normalize(self, x: torch.Tensor) -> torch.Tensor:
         """功率归一化(提高数值稳定性,适配float16)"""
         orig_dtype = x.dtype
-        with torch.amp.autocast(enabled=False):
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
             x_float = x.float()
             reduction_dims = list(range(1, x_float.dim()))
             power = torch.mean(x_float ** 2, dim=reduction_dims, keepdim=True)
@@ -175,7 +175,7 @@ class RayleighChannel(nn.Module):
     def _power_normalize(self, x: torch.Tensor) -> torch.Tensor:
         """功率归一化（提高数值稳定性，适配float16）"""
         orig_dtype = x.dtype
-        with torch.amp.autocast(enabled=False):
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
             x_float = x.float()
             reduction_dims = list(range(1, x_float.dim()))
             power = torch.mean(x_float ** 2, dim=reduction_dims, keepdim=True)
@@ -255,7 +255,7 @@ class RicianChannel(nn.Module):
     def _power_normalize(self, x: torch.Tensor) -> torch.Tensor:
         """功率归一化（提高数值稳定性，适配float16）"""
         orig_dtype = x.dtype
-        with torch.amp.autocast(enabled=False):
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
             x_float = x.float()
             reduction_dims = list(range(1, x_float.dim()))
             power = torch.mean(x_float ** 2, dim=reduction_dims, keepdim=True)
