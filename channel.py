@@ -107,13 +107,14 @@ class AWGNChannel(nn.Module):
     def _power_normalize(self, x: torch.Tensor) -> torch.Tensor:
         """功率归一化(提高数值稳定性,适配float16)"""
         orig_dtype = x.dtype
-        x_float = x.float()
-        reduction_dims = list(range(1, x_float.dim()))
-        power = torch.mean(x_float ** 2, dim=reduction_dims, keepdim=True)
-        k = torch.rsqrt(power + 1e-6)
-        x_norm = x * k.to(orig_dtype)
+        with torch.amp.autocast(enabled=False):
+            x_float = x.float()
+            reduction_dims = list(range(1, x_float.dim()))
+            power = torch.mean(x_float ** 2, dim=reduction_dims, keepdim=True)
+            k = torch.rsqrt(power + 1e-4)
+            x_norm = x_float * k
         
-        return x_norm
+        return x_norm.to(orig_dtype)
     
     def set_snr(self, snr_db: float):
         """设置信噪比"""
@@ -174,13 +175,14 @@ class RayleighChannel(nn.Module):
     def _power_normalize(self, x: torch.Tensor) -> torch.Tensor:
         """功率归一化（提高数值稳定性，适配float16）"""
         orig_dtype = x.dtype
-        x_float = x.float()
-        reduction_dims = list(range(1, x_float.dim()))
-        power = torch.mean(x_float ** 2, dim=reduction_dims, keepdim=True)
-        k = torch.rsqrt(power + 1e-6)
-        x_norm = x * k.to(orig_dtype)
+        with torch.amp.autocast(enabled=False):
+            x_float = x.float()
+            reduction_dims = list(range(1, x_float.dim()))
+            power = torch.mean(x_float ** 2, dim=reduction_dims, keepdim=True)
+            k = torch.rsqrt(power + 1e-4)
+            x_norm = x_float * k
        
-        return x_norm
+        return x_norm.to(orig_dtype)
       
     
     def set_snr(self, snr_db: float):
@@ -253,15 +255,16 @@ class RicianChannel(nn.Module):
     def _power_normalize(self, x: torch.Tensor) -> torch.Tensor:
         """功率归一化（提高数值稳定性，适配float16）"""
         orig_dtype = x.dtype
-        x_float = x.float()
-        reduction_dims = list(range(1, x_float.dim()))
-        power = torch.mean(x_float ** 2, dim=reduction_dims, keepdim=True)
-        k = torch.rsqrt(power + 1e-6)
-        x_norm = x * k.to(orig_dtype)
+        with torch.amp.autocast(enabled=False):
+            x_float = x.float()
+            reduction_dims = list(range(1, x_float.dim()))
+            power = torch.mean(x_float ** 2, dim=reduction_dims, keepdim=True)
+            k = torch.rsqrt(power + 1e-4)
+            x_norm = x_float * k
            
     
         
-        return x_norm
+        return x_norm.to(orig_dtype)
     
     def set_snr(self, snr_db: float):
         """设置信噪比"""

@@ -243,7 +243,9 @@ def train_one_epoch(
         # 移除torch.cuda.empty_cache()以提升训练速度
         
         # 前向传播（使用混合精度）
-        use_amp = config.use_amp and device.type == "cuda"
+        current_step = global_step + batch_idx
+        # 临时关闭AMP前100个step以定位NaN来源
+        use_amp = config.use_amp and device.type == "cuda" and current_step >= 100
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             results = model(
                 text_input=text_input,
