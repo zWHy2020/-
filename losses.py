@@ -319,9 +319,21 @@ class TextLoss(nn.Module):
         B, T, V = pred.shape
         pred_flat = pred.view(B * T, V)
         target_flat = target.view(B * T)
+        mask_flat = mask.view(B * T) if mask is not None else None
+        if mask_flat is not None:
+            pad_positions = target_flat[mask_flat == 0]
+            if pad_positions.numel() > 0:
+                self.loss_fn.ignore_index = int(pad_positions[0].item())
         
         # 1. 交叉熵损失
-        loss_ce = self.loss_fn(pred_flat, target_flat)
+        if mask_flat is not None:
+            valid_positions = mask_flat == 1
+            if valid_positions.any():
+                loss_ce = self.loss_fn(pred_flat[valid_positions], target_flat[valid_positions])
+            else:
+                loss_ce = torch.tensor(0.0, device=pred.device)
+        else:
+            loss_ce = self.loss_fn(pred_flat, target_flat)
         
         # 2. 文本-图像对比损失（如果提供）
         loss_contrastive = torch.tensor(0.0, device=pred.device)
