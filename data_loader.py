@@ -41,6 +41,11 @@ class MultimodalDataset(Dataset):
         self.max_text_length = max_text_length
         self.max_video_frames = max_video_frames
         self.image_size = image_size
+        self.text_pad_token_id = (
+            self.text_tokenizer.pad_token_id
+            if self.text_tokenizer is not None and hasattr(self.text_tokenizer, 'pad_token_id')
+            else 0
+        )
         
         # 默认图像变换
         if self.image_transform is None:
@@ -125,7 +130,8 @@ class MultimodalDataset(Dataset):
             
             return {
                 'input_ids': input_ids,
-                'attention_mask': attention_mask
+                'attention_mask': attention_mask,
+                'pad_token_id': self.text_pad_token_id
             }
         except Exception as e:
             print(f"加载文本数据时出错: {e}")
@@ -347,6 +353,9 @@ def collate_multimodal_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             # 文本数据
             input_ids = [item['input_ids'] for item in modality_data]
             attention_mask = [item['attention_mask'] for item in modality_data]
+            pad_token_id = 0
+            if 'pad_token_id' in modality_data[0] and modality_data[0]['pad_token_id'] is not None:
+                pad_token_id = int(modality_data[0]['pad_token_id'])
             
             # 填充到相同长度
             max_len = max(len(ids) for ids in input_ids)
@@ -355,7 +364,9 @@ def collate_multimodal_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             
             for ids, mask in zip(input_ids, attention_mask):
                 pad_len = max_len - len(ids)
-                padded_input_ids.append(torch.cat([ids, torch.zeros(pad_len, dtype=ids.dtype)]))
+                padded_input_ids.append(
+                    torch.cat([ids, torch.full((pad_len,), pad_token_id, dtype=ids.dtype)])
+                )
                 padded_attention_mask.append(torch.cat([mask, torch.zeros(pad_len, dtype=mask.dtype)]))
             
             # 为缺失的样本创建零填充
@@ -369,7 +380,7 @@ def collate_multimodal_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
                     full_batch_attention_mask.append(padded_attention_mask[idx])
                 else:
                     # 创建零填充
-                    full_batch_input_ids.append(torch.zeros(max_len, dtype=torch.long))
+                    full_batch_input_ids.append(torch.full((max_len,), pad_token_id, dtype=torch.long))
                     full_batch_attention_mask.append(torch.zeros(max_len, dtype=torch.long))
             
             inputs['text_input'] = torch.stack(full_batch_input_ids)
@@ -472,4 +483,3 @@ def create_sample_data(
         data_list.append(sample)
     
     return data_list
-
