@@ -10,6 +10,35 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any
 import math
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _log_nonfinite(name: str, tensor: torch.Tensor) -> bool:
+    if not torch.is_tensor(tensor):
+        return False
+    finite_mask = torch.isfinite(tensor)
+    if finite_mask.all():
+        return False
+    with torch.no_grad():
+        finite_values = tensor[finite_mask]
+        if finite_values.numel() > 0:
+            t_min = finite_values.min().item()
+            t_max = finite_values.max().item()
+            t_mean = finite_values.mean().item()
+        else:
+            t_min = float("nan")
+            t_max = float("nan")
+            t_mean = float("nan")
+    logger.warning(
+        "%s has NaN/Inf values (finite stats min=%.6e max=%.6e mean=%.6e)",
+        name,
+        t_min,
+        t_max,
+        t_mean,
+    )
+    return True
 
 
 class PositionalEncoding(nn.Module):
@@ -332,7 +361,8 @@ class TextJSCCEncoder(nn.Module):
         
         # 引导向量处理
         guide_vector = self.guide_extractor(guide_vector)
-        
+        _log_nonfinite("TextJSCCEncoder.encoded_features", encoded_features)
+        _log_nonfinite("TextJSCCEncoder.guide_vector", guide_vector)
         return encoded_features, guide_vector
 
 
