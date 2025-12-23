@@ -144,6 +144,40 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
+def _log_nonfinite_tensor(
+    logger: logging.Logger,
+    tensor: torch.Tensor,
+    name: str,
+    batch_idx: int,
+    stage: str,
+) -> bool:
+    if not torch.is_tensor(tensor):
+        return False
+    finite_mask = torch.isfinite(tensor)
+    if finite_mask.all():
+        return False
+    with torch.no_grad():
+        finite_values = tensor[finite_mask]
+        if finite_values.numel() > 0:
+            t_min = finite_values.min().item()
+            t_max = finite_values.max().item()
+            t_mean = finite_values.mean().item()
+        else:
+            t_min = float("nan")
+            t_max = float("nan")
+            t_mean = float("nan")
+    logger.warning(
+        "Batch %d stage=%s tensor=%s contains NaN/Inf (finite stats min=%.6e max=%.6e mean=%.6e)",
+        batch_idx + 1,
+        stage,
+        name,
+        t_min,
+        t_max,
+        t_mean,
+    )
+    return True
+
+
 def train_one_epoch(
     model: MultimodalJSCC,
     train_loader: DataLoader,
@@ -254,6 +288,14 @@ def train_one_epoch(
                 text_attention_mask=attention_mask,
                 snr_db=snr_db
             )
+            for key, value in results.items():
+                _log_nonfinite_tensor(
+                    logger=logger,
+                    tensor=value,
+                    name=f"results[{key}]",
+                    batch_idx=batch_idx,
+                    stage="forward_output",
+                )
             
             # 【Phase 3】如果启用对抗训练，计算判别器输出
             discriminator_outputs = None
@@ -284,6 +326,14 @@ def train_one_epoch(
                 attention_mask=attention_mask,
                 discriminator_outputs=discriminator_outputs  # 【Phase 3】传递判别器输出
             )
+            for key, value in loss_dict.items():
+                _log_nonfinite_tensor(
+                    logger=logger,
+                    tensor=value,
+                    name=f"loss_dict[{key}]",
+                    batch_idx=batch_idx,
+                    stage="loss_output",
+                )
             
             total_loss = loss_dict['total_loss']
             # 检查损失值是否有效
@@ -296,6 +346,17 @@ def train_one_epoch(
             
             # 梯度累积：损失需要除以累积步数
             total_loss = total_loss / accumulation_steps
+            if _log_nonfinite_tensor(
+                logger=logger,
+                tensor=total_loss,
+                name="total_loss",
+                batch_idx=batch_idx,
+                stage="pre_backward",
+            ):
+                logger.warning(f"批次 {batch_idx + 1}: 反向传播前 total_loss NaN/Inf，跳过")
+                del results, loss_dict, total_loss
+                skipped_loss_nan += 1
+                continue
         
         # 反向传播（使用混合精度）
         if scaler is not None:
@@ -345,11 +406,25 @@ def train_one_epoch(
                 if scaler is not None:
                     scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
-                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                        logger.warning(f"批次 {batch_idx + 1}: 检测到无效梯度 (norm={grad_norm:.2f})，Scaler将自动处理跳过")
+                    if _log_nonfinite_tensor(
+                        logger=logger,
+                        tensor=grad_norm,
+                        name="grad_norm",
+                        batch_idx=batch_idx,
+                        stage="grad_clip",
+                    ):
+                        logger.warning(
+                            f"批次 {batch_idx + 1}: 检测到无效梯度 (norm={grad_norm:.2f})，Scaler将自动处理跳过"
+                        )
                 else:
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
-                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    if _log_nonfinite_tensor(
+                        logger=logger,
+                        tensor=grad_norm,
+                        name="grad_norm",
+                        batch_idx=batch_idx,
+                        stage="grad_clip",
+                    ):
                         logger.warning(f"批次 {batch_idx + 1}: 检测到无效梯度，手动跳过更新")
                         skip_update_manual = True
             if skip_update_manual:

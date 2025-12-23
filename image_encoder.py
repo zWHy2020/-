@@ -19,6 +19,7 @@ from typing import Optional, Tuple, List,Union
 import math
 from torch.utils.checkpoint import checkpoint
 import timm
+import logging
 # 【Phase 1】尝试导入timm库用于预训练权重
 try:
     import timm
@@ -26,6 +27,34 @@ try:
 except ImportError:
     TIMM_AVAILABLE = False
     print("警告: timm库未安装，将无法使用预训练权重。建议安装: pip install timm")
+
+logger = logging.getLogger(__name__)
+
+
+def _log_nonfinite(name: str, tensor: torch.Tensor) -> bool:
+    if not torch.is_tensor(tensor):
+        return False
+    finite_mask = torch.isfinite(tensor)
+    if finite_mask.all():
+        return False
+    with torch.no_grad():
+        finite_values = tensor[finite_mask]
+        if finite_values.numel() > 0:
+            t_min = finite_values.min().item()
+            t_max = finite_values.max().item()
+            t_mean = finite_values.mean().item()
+        else:
+            t_min = float("nan")
+            t_max = float("nan")
+            t_mean = float("nan")
+    logger.warning(
+        "%s has NaN/Inf values (finite stats min=%.6e max=%.6e mean=%.6e)",
+        name,
+        t_min,
+        t_max,
+        t_mean,
+    )
+    return True
 
 class TextModulator(nn.Module):
     def __init__(self, img_dim: int, text_dim: int):
@@ -984,6 +1013,8 @@ class ImageJSCCEncoder(nn.Module):
             f"ImageJSCCEncoder.output_proj 维度不匹配: got {encoded_features.shape[-1]},"
             f" expected {self.output_proj[-1].out_features}"
         )
+        _log_nonfinite("ImageJSCCEncoder.encoded_features", encoded_features)
+        _log_nonfinite("ImageJSCCEncoder.guide_vector", guide_vector)
         return encoded_features, guide_vector
 
             # 验证输入维度是否与 layer 的 input_resolution 匹配
@@ -1329,6 +1360,5 @@ class ImageJSCCDecoder(nn.Module):
         # 轻微的对比度增强：x = x^0.9，保持范围在[0,1]但增强对比度
         #x = torch.clamp(x, 0.0, 1.0)  # 确保在[0,1]范围内
         
+        _log_nonfinite("ImageJSCCDecoder.output", x)
         return x
-
-

@@ -10,6 +10,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Union
 import math
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Channel(nn.Module):
@@ -111,6 +114,23 @@ class AWGNChannel(nn.Module):
             x_float = x.float()
             reduction_dims = list(range(1, x_float.dim()))
             power = torch.mean(x_float ** 2, dim=reduction_dims, keepdim=True)
+            power_min = power.min().item()
+            power_max = power.max().item()
+            power_mean = power.mean().item()
+            logger.debug(
+                "AWGNChannel power stats: min=%.6e max=%.6e mean=%.6e",
+                power_min,
+                power_max,
+                power_mean,
+            )
+            if not torch.isfinite(power).all() or power_min < 1e-12:
+                logger.warning(
+                    "AWGNChannel power stats show non-finite or tiny values: "
+                    "min=%.6e max=%.6e mean=%.6e",
+                    power_min,
+                    power_max,
+                    power_mean,
+                )
             k = torch.rsqrt(power + 1e-4)
             x_norm = x_float * k
         
@@ -179,6 +199,23 @@ class RayleighChannel(nn.Module):
             x_float = x.float()
             reduction_dims = list(range(1, x_float.dim()))
             power = torch.mean(x_float ** 2, dim=reduction_dims, keepdim=True)
+            power_min = power.min().item()
+            power_max = power.max().item()
+            power_mean = power.mean().item()
+            logger.debug(
+                "RayleighChannel power stats: min=%.6e max=%.6e mean=%.6e",
+                power_min,
+                power_max,
+                power_mean,
+            )
+            if not torch.isfinite(power).all() or power_min < 1e-12:
+                logger.warning(
+                    "RayleighChannel power stats show non-finite or tiny values: "
+                    "min=%.6e max=%.6e mean=%.6e",
+                    power_min,
+                    power_max,
+                    power_mean,
+                )
             k = torch.rsqrt(power + 1e-4)
             x_norm = x_float * k
        
@@ -259,6 +296,23 @@ class RicianChannel(nn.Module):
             x_float = x.float()
             reduction_dims = list(range(1, x_float.dim()))
             power = torch.mean(x_float ** 2, dim=reduction_dims, keepdim=True)
+            power_min = power.min().item()
+            power_max = power.max().item()
+            power_mean = power.mean().item()
+            logger.debug(
+                "RicianChannel power stats: min=%.6e max=%.6e mean=%.6e",
+                power_min,
+                power_max,
+                power_mean,
+            )
+            if not torch.isfinite(power).all() or power_min < 1e-12:
+                logger.warning(
+                    "RicianChannel power stats show non-finite or tiny values: "
+                    "min=%.6e max=%.6e mean=%.6e",
+                    power_min,
+                    power_max,
+                    power_mean,
+                )
             k = torch.rsqrt(power + 1e-4)
             x_norm = x_float * k
            

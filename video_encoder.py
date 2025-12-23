@@ -11,7 +11,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict, Any
 import math
+import logging
 from image_encoder import SNRModulator
+
+logger = logging.getLogger(__name__)
+
+
+def _log_nonfinite(name: str, tensor: torch.Tensor) -> bool:
+    if not torch.is_tensor(tensor):
+        return False
+    finite_mask = torch.isfinite(tensor)
+    if finite_mask.all():
+        return False
+    with torch.no_grad():
+        finite_values = tensor[finite_mask]
+        if finite_values.numel() > 0:
+            t_min = finite_values.min().item()
+            t_max = finite_values.max().item()
+            t_mean = finite_values.mean().item()
+        else:
+            t_min = float("nan")
+            t_max = float("nan")
+            t_mean = float("nan")
+    logger.warning(
+        "%s has NaN/Inf values (finite stats min=%.6e max=%.6e mean=%.6e)",
+        name,
+        t_min,
+        t_max,
+        t_mean,
+    )
+    return True
 
 
 class LightweightTemporalConv(nn.Module):
@@ -513,7 +542,9 @@ class VideoJSCCEncoder(nn.Module):
         # 堆叠所有帧的特征
         encoded_features = torch.stack(encoded_features, dim=1)  # [B, T, C, H, W]
         guide_vectors = torch.stack(guide_vectors, dim=1)  # [B, T, guide_dim]
-        
+        _log_nonfinite("VideoJSCCEncoder.encoded_features", encoded_features)
+        _log_nonfinite("VideoJSCCEncoder.guide_vectors", guide_vectors)
+
         return encoded_features, guide_vectors
     
     def _warp_features(self, features: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
