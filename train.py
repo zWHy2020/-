@@ -403,6 +403,17 @@ def train_one_epoch(
             # 梯度裁剪（更严格的裁剪，防止梯度爆炸）
             skip_update_manual = False
             if config.grad_clip_norm > 0:
+                # 诊断：在裁剪前检查梯度是否存在NaN/Inf
+                bad_grads = []
+                for name, p in model.named_parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        bad_grads.append(name)
+                if bad_grads:
+                    logger.warning(
+                        f"批次 {batch_idx + 1}: 检测到非有限梯度 | indices={batch_indices_str} | bad_params={bad_grads[:5]}"
+                    )
+                    skip_update_manual = True
+
                 if scaler is not None:
                     scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
