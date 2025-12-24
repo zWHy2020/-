@@ -95,6 +95,9 @@ class MultimodalDataset(Dataset):
             video_data = self._load_video(item['video'])
             if video_data is not None:
                 sample['video'] = video_data
+
+        # 记录样本索引用于诊断
+        sample['sample_index'] = idx
         
         return sample
     
@@ -325,6 +328,7 @@ def collate_multimodal_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     inputs = {}
     targets = {}
     attention_masks = {}
+    indices = [sample.pop('sample_index', None) for sample in batch]
     
     # 收集所有模态的数据
     modalities = set()
@@ -426,7 +430,8 @@ def collate_multimodal_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     # 构建最终批次
     batch_data = {
         'inputs': inputs,
-        'targets': targets
+        'targets': targets,
+        'indices': indices
     }
     # 将文本 attention_mask 直接传到 batch 根上，供损失函数使用
     if 'text_attention_mask' in inputs:
