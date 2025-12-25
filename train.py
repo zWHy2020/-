@@ -231,6 +231,8 @@ def train_one_epoch(
 
     for batch_idx, batch in enumerate(train_loader):
         start_time = time.time()
+        batch_indices = batch.get('indices', None)
+        batch_indices_str = f"{list(batch_indices)}" if batch_indices is not None else "N/A"
         
         # 移除torch.cuda.empty_cache()以提升训练速度
         
@@ -259,6 +261,12 @@ def train_one_epoch(
             attention_mask = attention_mask.to(device, non_blocking=True) if attention_mask is not None else None
         if image_input is not None:
             image_input = image_input.to(device, non_blocking=True)
+            # 防御：裁剪到合法范围并检查有限性
+            image_input = torch.clamp(image_input, 0.0, 1.0)
+            if not torch.isfinite(image_input).all():
+                logger.warning(f"批次 {batch_idx + 1}: image_input 含 NaN/Inf，跳过 | indices={batch_indices_str}")
+                skipped_loss_nan += 1
+                continue
         if video_input is not None:
             video_input = video_input.to(device, non_blocking=True)
         
@@ -277,9 +285,7 @@ def train_one_epoch(
         # 移除torch.cuda.empty_cache()以提升训练速度
         
         # 前向传播（使用混合精度）
-        current_step = global_step + batch_idx
-        # 临时关闭AMP前100个step以定位NaN来源
-        use_amp = config.use_amp and device.type == "cuda" and current_step >= 100
+        use_amp = config.use_amp and device.type == "cuda"
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             results = model(
                 text_input=text_input,
@@ -353,7 +359,7 @@ def train_one_epoch(
                 batch_idx=batch_idx,
                 stage="pre_backward",
             ):
-                logger.warning(f"批次 {batch_idx + 1}: 反向传播前 total_loss NaN/Inf，跳过")
+                logger.warning(f"批次 {batch_idx + 1}: 反向传播前 total_loss NaN/Inf，跳过 | indices={batch_indices_str}")
                 del results, loss_dict, total_loss
                 skipped_loss_nan += 1
                 continue
@@ -403,6 +409,17 @@ def train_one_epoch(
             # 梯度裁剪（更严格的裁剪，防止梯度爆炸）
             skip_update_manual = False
             if config.grad_clip_norm > 0:
+                # 诊断：在裁剪前检查梯度是否存在NaN/Inf
+                bad_grads = []
+                for name, p in model.named_parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        bad_grads.append(name)
+                if bad_grads:
+                    logger.warning(
+                        f"批次 {batch_idx + 1}: 检测到非有限梯度 | indices={batch_indices_str} | bad_params={bad_grads[:5]}"
+                    )
+                    skip_update_manual = True
+
                 if scaler is not None:
                     scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
@@ -414,7 +431,7 @@ def train_one_epoch(
                         stage="grad_clip",
                     ):
                         logger.warning(
-                            f"批次 {batch_idx + 1}: 检测到无效梯度 (norm={grad_norm:.2f})，Scaler将自动处理跳过"
+                            f"批次 {batch_idx + 1}: 检测到无效梯度 (norm={grad_norm:.2f})，Scaler将自动处理跳过 | indices={batch_indices_str}"
                         )
                 else:
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
@@ -425,7 +442,7 @@ def train_one_epoch(
                         batch_idx=batch_idx,
                         stage="grad_clip",
                     ):
-                        logger.warning(f"批次 {batch_idx + 1}: 检测到无效梯度，手动跳过更新")
+                        logger.warning(f"批次 {batch_idx + 1}: 检测到无效梯度，手动跳过更新 | indices={batch_indices_str}")
                         skip_update_manual = True
             if skip_update_manual:
                 skipped_grad_nan += 1
@@ -638,6 +655,7 @@ def main():
     parser.add_argument('--max-val-samples', type=int, default=None, help='最大验证样本数（None表示使用全部数据）')
     parser.add_argument('--local-rank', type=int, default=None, help='分布式训练的本地进程rank')
     parser.add_argument('--distributed', action='store_true', help='启用分布式训练')
+    parser.add_argument('--use-gradscaler', action='store_true', help='显式启用 GradScaler（默认关闭以避免已知 NaN）')
     args = parser.parse_args()
     
     # 设置随机种子
@@ -817,10 +835,13 @@ def main():
     scheduler = create_scheduler(optimizer, config)
     
     # 创建混合精度训练的scaler（如果启用）
+    config.use_gradscaler = args.use_gradscaler or getattr(config, "use_gradscaler", False)
     scaler = None
-    if config.use_amp and config.device.type == "cuda":
-        scaler = torch.amp.GradScaler('cuda')  # 修复：使用新的API，避免FutureWarning
-        logger.info("启用混合精度训练（AMP）")
+    if config.use_amp and config.device.type == "cuda" and config.use_gradscaler:
+        scaler = torch.amp.GradScaler('cuda')
+        logger.info("启用混合精度训练（AMP）并使用 GradScaler（可能存在已知 NaN 风险）。")
+    elif config.use_amp and config.device.type == "cuda":
+        logger.info("启用混合精度训练（AMP），默认禁用 GradScaler 以避免已知 NaN。")
     elif config.use_amp:
         logger.warning("检测到非CUDA设备，已禁用混合精度训练（AMP）。")
     
