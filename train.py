@@ -642,7 +642,6 @@ def validate(
         return avg_metrics
 
 
-
 def main():
     parser = argparse.ArgumentParser(description='多模态JSCC训练脚本')
     parser.add_argument('--data-dir', type=str, required=True, help='数据目录')
