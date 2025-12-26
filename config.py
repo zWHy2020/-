@@ -38,6 +38,8 @@ class TrainingConfig:
         self.grad_clip_norm = 1.0
         self.gradient_accumulation_steps = 2  # 优化：按比例降低，保持等效批次大小=8*8=64不变
         self.use_amp = False  # 是否使用混合精度训练（自动混合精度）
+        # 默认禁用 GradScaler，避免已知的 AMP+GradScaler 在图像分支触发 NaN；需要时可显式开启
+        self.use_gradscaler = False
         
         # 学习率调度
         self.lr_scheduler = 'cosine'  # 'cosine', 'step', 'plateau'
