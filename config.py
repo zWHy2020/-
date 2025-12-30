@@ -57,10 +57,19 @@ class TrainingConfig:
         self.reconstruction_weight = 1.0
         self.perceptual_weight = 0.01  # 【重构】启用LPIPS感知损失以提升重建质量
         self.temporal_weight = 0.05  # 降低时序损失权重
-        self.text_contrastive_weight = 0.1  # 【新增】文本-图像对比损失权重
-        self.video_text_contrastive_weight = 0.05  # 【新增】视频-文本对比损失权重
+        self.text_contrastive_weight = 0.0  # 路线1默认关闭文本-图像对比
+        self.video_text_contrastive_weight = 0.1  # 【新增】视频-文本对比损失权重
         self.rate_weight = 1e-4  # 【新增】码率/能量约束权重
         self.temporal_consistency_weight = 0.02  # 【新增】视频时序一致性正则权重
+        # 文本引导与条件约束（路线1默认）
+        self.use_text_guidance_image = False
+        self.use_text_guidance_video = True
+        self.enforce_text_condition = True
+        self.condition_margin_weight = 0.1
+        self.condition_margin = 0.05
+        self.condition_prob = 0.5
+        self.condition_only_low_snr = True
+        self.condition_low_snr_threshold = 5.0
         
         # SNR设置
         self.train_snr_min = -5.0  # 训练时SNR范围
@@ -100,6 +109,8 @@ class TrainingConfig:
         self.max_text_length = 512
         self.max_video_frames = 3
         self.max_samples = 65536  # 【Phase 4】默认最大样本数
+        self.allow_missing_modalities = False
+        self.strict_data_loading = True
         
         # 【Phase 1】迁移学习参数
         self.pretrained = True  # 【Phase 4】默认启用预训练权重
@@ -192,4 +203,13 @@ class EvaluationConfig:
         
         self.channel_type = "awgn"
         self.snr_db = 10.0
+        # 文本引导与条件约束（评估侧保持与训练一致的开关）
+        self.use_text_guidance_image = False
+        self.use_text_guidance_video = True
+        self.enforce_text_condition = True
+        self.condition_prob = 0.0  # 评估默认不触发额外 condition-margin 计算
+        self.condition_margin = 0.05
+        self.condition_margin_weight = 0.1
+        self.condition_only_low_snr = True
+        self.condition_low_snr_threshold = 5.0
 

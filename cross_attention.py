@@ -68,8 +68,9 @@ class CrossAttention(nn.Module):
         self, 
         query: torch.Tensor, 
         guide_vector: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        attention_mask: Optional[torch.Tensor] = None,
+        return_attention: bool = False
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """
         前向传播（修复版）
         
@@ -137,6 +138,8 @@ class CrossAttention(nn.Module):
         # 输出投影
         output = self.out_proj(attn_output)
         
+        if return_attention:
+            return output, attn_weights
         return output
 
 

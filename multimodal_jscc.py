@@ -62,6 +62,14 @@ class MultimodalJSCC(nn.Module):
         power_normalization: bool = True,
         use_quantization_noise: bool = False,
         quantization_noise_range: float = 0.5,
+        use_text_guidance_image: bool = False,
+        use_text_guidance_video: bool = True,
+        enforce_text_condition: bool = True,
+        condition_margin_weight: float = 0.1,
+        condition_margin: float = 0.05,
+        condition_prob: float = 0.5,
+        condition_only_low_snr: bool = True,
+        condition_low_snr_threshold: float = 5.0,
         
         # 训练参数
     ):
@@ -149,6 +157,14 @@ class MultimodalJSCC(nn.Module):
         )
         self.use_quantization_noise = use_quantization_noise
         self.quantization_noise_range = quantization_noise_range
+        self.use_text_guidance_image = use_text_guidance_image
+        self.use_text_guidance_video = use_text_guidance_video
+        self.enforce_text_condition = enforce_text_condition
+        self.condition_margin_weight = condition_margin_weight
+        self.condition_margin = condition_margin
+        self.condition_prob = condition_prob
+        self.condition_only_low_snr = condition_only_low_snr
+        self.condition_low_snr_threshold = condition_low_snr_threshold
         
         # 功率归一化
         #self.power_normalizer = nn.ModuleDict({
@@ -188,6 +204,8 @@ class MultimodalJSCC(nn.Module):
         text_input = self._validate_input(text_input, 'text')
         image_input = self._validate_input(image_input, 'image')
         video_input = self._validate_input(video_input, 'video')
+        if self.use_text_guidance_video and video_input is not None and text_input is None:
+            raise RuntimeError("use_text_guidance_video=True 但缺少文本输入，无法提供语义条件。")
         
         # 编码阶段
         encoded_features = {}
@@ -303,10 +321,11 @@ class MultimodalJSCC(nn.Module):
         
         # 图像解码（使用文本语义引导）
         if 'image' in transmitted_features and image_input is not None:
+            semantic_for_image = text_encoded_for_semantic if self.use_text_guidance_image else None
             image_decoded = self.image_decoder(
                 transmitted_features['image'],
                 guide_vectors['image'],
-                semantic_context=text_encoded_for_semantic,  # 使用原始文本编码（未归一化）作为语义上下文
+                semantic_context=semantic_for_image,  # 路线1默认禁用 text->image
                 snr_db=snr_db
             )
             decoded_outputs['image'] = image_decoded
@@ -314,13 +333,20 @@ class MultimodalJSCC(nn.Module):
         
         # 视频解码（使用文本语义引导）
         if 'video' in transmitted_features and video_input is not None:
+            semantic_for_video = text_encoded_for_semantic if self.use_text_guidance_video else None
+            if self.use_text_guidance_video and semantic_for_video is None:
+                raise RuntimeError("视频解码需要语义上下文，但文本编码缺失。")
             video_decoded = self.video_decoder(
                 transmitted_features['video'],
                 guide_vectors['video'],
-                semantic_context=text_encoded_for_semantic  # 使用原始文本编码（未归一化）作为语义上下文
+                semantic_context=semantic_for_video  # 使用原始文本编码（未归一化）作为语义上下文
             )
             decoded_outputs['video'] = video_decoded
             results['video_decoded'] = video_decoded
+            if getattr(self.video_decoder, "last_semantic_gate_stats", None):
+                stats = self.video_decoder.last_semantic_gate_stats
+                results["video_semantic_gate_mean"] = stats.get("mean")
+                results["video_semantic_gate_std"] = stats.get("std")
         
         results.update(decoded_outputs)
         return results
@@ -353,12 +379,12 @@ class MultimodalJSCC(nn.Module):
         # 检查张量是否包含有效数据
         if input_tensor.numel() == 0:
             print(f"警告: {modality}输入为空张量")
-            return None
+            return input_tensor
         
-        # 检查是否全为零（可能是填充的零张量）
+        # 检查是否全为零（可能是填充的零张量），仅提示
         if torch.all(input_tensor == 0):
-            print(f"警告: {modality}输入全为零，可能是填充数据")
-            return None
+            print(f"警告: {modality}输入全为零，可能是填充数据或缺失模态占位")
+            return input_tensor
         
         # 检查形状
         if modality == 'text' and input_tensor.dim() != 2:
@@ -456,10 +482,11 @@ class MultimodalJSCC(nn.Module):
         
         # 图像解码（使用文本语义引导，如果提供）
         if 'image' in transmitted_features:
+            semantic_for_image = semantic_context if self.use_text_guidance_image else None
             image_decoded = self.image_decoder(
                 transmitted_features['image'],
                 guide_vectors['image'],
-                semantic_context=semantic_context,
+                semantic_context=semantic_for_image,
                 multiple_semantic_contexts=multiple_semantic_contexts,  # 传递语义上下文
                 snr_db=snr_db
             )
@@ -467,13 +494,20 @@ class MultimodalJSCC(nn.Module):
         
         # 视频解码（使用文本语义引导，如果提供）
         if 'video' in transmitted_features:
+            if self.use_text_guidance_video and semantic_context is None:
+                raise RuntimeError("use_text_guidance_video=True 但未提供 semantic_context。")
+            semantic_for_video = semantic_context if self.use_text_guidance_video else None
             video_decoded = self.video_decoder(
                 transmitted_features['video'],
                 guide_vectors['video'],
-                semantic_context=semantic_context,  # 传递语义上下文
+                semantic_context=semantic_for_video,  # 传递语义上下文
                 multiple_semantic_contexts=multiple_semantic_contexts
             )
             results['video_decoded'] = video_decoded
+            if getattr(self.video_decoder, "last_semantic_gate_stats", None):
+                stats = self.video_decoder.last_semantic_gate_stats
+                results["video_semantic_gate_mean"] = stats.get("mean")
+                results["video_semantic_gate_std"] = stats.get("std")
         
         return results
     

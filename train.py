@@ -22,6 +22,7 @@ import argparse
 import logging
 import json
 import math
+from functools import partial
 
 # 导入模型和工具
 from multimodal_jscc import MultimodalJSCC
@@ -76,7 +77,15 @@ def create_model(config: TrainingConfig) -> MultimodalJSCC:
         channel_type=config.channel_type,
         snr_db=config.snr_db,
         use_quantization_noise=getattr(config, 'use_quantization_noise', False),
-        quantization_noise_range=getattr(config, 'quantization_noise_range', 0.5)
+        quantization_noise_range=getattr(config, 'quantization_noise_range', 0.5),
+        use_text_guidance_image=getattr(config, "use_text_guidance_image", False),
+        use_text_guidance_video=getattr(config, "use_text_guidance_video", True),
+        enforce_text_condition=getattr(config, "enforce_text_condition", True),
+        condition_margin_weight=getattr(config, "condition_margin_weight", 0.0),
+        condition_margin=getattr(config, "condition_margin", 0.05),
+        condition_prob=getattr(config, "condition_prob", 0.0),
+        condition_only_low_snr=getattr(config, "condition_only_low_snr", False),
+        condition_low_snr_threshold=getattr(config, "condition_low_snr_threshold", 5.0),
     )
     return model
 
@@ -96,6 +105,8 @@ def create_loss_fn(config: TrainingConfig) -> MultimodalLoss:
         temporal_consistency_weight=getattr(config, 'temporal_consistency_weight', 0.02),  # 【新增】视频时序一致性正则权重
         discriminator_weight=getattr(config, 'discriminator_weight', 0.01),  # 【Phase 3】对抗损失权重
         use_adversarial=getattr(config, 'use_adversarial', False),  # 【Phase 3】是否使用对抗训练
+        condition_margin_weight=getattr(config, "condition_margin_weight", 0.0),
+        condition_margin=getattr(config, "condition_margin", 0.05),
         data_range=1.0
     )
     return loss_fn
@@ -210,6 +221,8 @@ def train_one_epoch(
         'video_recon_loss': AverageMeter(),
         'video_percep_loss': AverageMeter(),
         'video_temporal_loss': AverageMeter(),
+        'condition_margin_loss': AverageMeter(),
+        'video_semantic_gate_mean': AverageMeter(),
         'time': AverageMeter()
     }
 
@@ -319,6 +332,35 @@ def train_one_epoch(
                     #if video_disc_pred is not None:
                         #discriminator_outputs['video'] = video_disc_pred
             
+            # 条件边际约束：对同一传输特征使用打乱文本解码，强制文本条件有效
+            condition_enabled = (
+                getattr(config, "enforce_text_condition", False)
+                and getattr(config, "condition_margin_weight", 0.0) > 0
+                and results.get("video_transmitted") is not None
+                and results.get("video_guide") is not None
+                and results.get("text_encoded") is not None
+                and results.get("video_decoded") is not None
+                and results["text_encoded"].shape[0] > 1
+                and (not getattr(config, "condition_only_low_snr", False) or snr_db <= getattr(config, "condition_low_snr_threshold", 5.0))
+                and np.random.rand() < getattr(config, "condition_prob", 0.0)
+            )
+            if condition_enabled:
+                with torch.no_grad():
+                    shuffle_idx = torch.randperm(results["text_encoded"].shape[0], device=device)
+                shuffled_context = results["text_encoded"][shuffle_idx]
+                # 使用相同的传输特征+guide进行第二次解码
+                shuffled_video = real_model.video_decoder(
+                    results["video_transmitted"],
+                    results["video_guide"],
+                    semantic_context=shuffled_context,
+                    reset_state=True,
+                )
+                results["video_decoded_shuffled"] = shuffled_video
+                if getattr(real_model.video_decoder, "last_semantic_gate_stats", None):
+                    stats = real_model.video_decoder.last_semantic_gate_stats
+                    results["video_semantic_gate_mean_shuffled"] = stats.get("mean")
+                    results["video_semantic_gate_std_shuffled"] = stats.get("std")
+
             # 计算损失
             loss_dict = loss_fn(
                 predictions=results,
@@ -496,6 +538,10 @@ def train_one_epoch(
             meters['video_percep_loss'].update(loss_dict.get('video_percep_loss_msssim', 0.0))
         if 'video_temporal_loss_l1' in loss_dict:
             meters['video_temporal_loss'].update(loss_dict.get('video_temporal_loss_l1', 0.0))
+        if 'condition_margin_loss' in loss_dict:
+            meters['condition_margin_loss'].update(loss_dict.get('condition_margin_loss', 0.0))
+        if results.get("video_semantic_gate_mean") is not None:
+            meters['video_semantic_gate_mean'].update(results.get("video_semantic_gate_mean", 0.0))
         
         # 修复OOM：在更新指标后立即清理中间变量
         del results, loss_dict, total_loss
@@ -680,12 +726,14 @@ def main():
     if args.train_manifest:
         config.train_manifest = os.path.join(config.data_dir, args.train_manifest)
     else:
-        config.train_manifest = os.path.join(config.data_dir, 'train_manifest.json')
+        default_train_v2 = os.path.join(config.data_dir, "train_manifest_v2.json")
+        config.train_manifest = default_train_v2 if os.path.exists(default_train_v2) else os.path.join(config.data_dir, 'train_manifest.json')
     
     if args.val_manifest:
         config.val_manifest = os.path.join(config.data_dir, args.val_manifest)
     else:
-        config.val_manifest = os.path.join(config.data_dir, 'val_manifest.json')
+        default_val_v2 = os.path.join(config.data_dir, "val_manifest_v2.json")
+        config.val_manifest = default_val_v2 if os.path.exists(default_val_v2) else os.path.join(config.data_dir, 'val_manifest.json')
     
     if args.batch_size:
         config.batch_size = args.batch_size
@@ -745,6 +793,23 @@ def main():
     
     logger.info(f"训练样本数: {len(train_data_list)}")
     logger.info(f"验证样本数: {len(val_data_list) if val_data_list else 0}")
+    def _log_manifest_stats(name: str, data_list):
+        if not data_list:
+            return
+        vids = set()
+        captions = []
+        keyframes = []
+        for item in data_list:
+            vid = item.get("meta", {}).get("video_id") or os.path.basename(item.get("video", {}).get("file", ""))
+            if vid:
+                vids.add(vid)
+            text_info = item.get("text", {})
+            captions.append(len(text_info.get("texts", [])) if "texts" in text_info else (1 if "text" in text_info else 0))
+            image_info = item.get("image", {})
+            keyframes.append(len(image_info.get("files", [])) if "files" in image_info else (1 if "file" in image_info else 0))
+        logger.info(f"{name} unique videos: {len(vids)}, captions/vid mean={np.mean(captions):.2f}, keyframes/vid mean={np.mean(keyframes):.2f}")
+    _log_manifest_stats("训练", train_data_list)
+    _log_manifest_stats("验证", val_data_list)
     
     # 计算每个epoch的迭代数
     iterations_per_epoch = (len(train_data_list) + config.batch_size - 1) // config.batch_size
@@ -844,12 +909,21 @@ def main():
         image_size=config.img_size,
         max_text_length=config.max_text_length,
         max_video_frames=config.max_video_frames,
-        prefetch_factor=getattr(config, 'prefetch_factor', 2)
+        prefetch_factor=getattr(config, 'prefetch_factor', 2),
+        allow_missing_modalities=getattr(config, "allow_missing_modalities", False),
+        strict_mode=getattr(config, "strict_data_loading", True),
+        required_modalities=("video", "text"),
+        seed=config.seed,
     )
     
     # 创建训练数据集和加载器
-    train_dataset = data_loader_manager.create_dataset(train_data_list)
+    train_dataset = data_loader_manager.create_dataset(train_data_list, is_train=True)
     train_sampler = None
+    collate_fn = partial(
+        collate_multimodal_batch,
+        allow_missing_modalities=data_loader_manager.allow_missing_modalities,
+        required_modalities=("video", "text"),
+    )
     if is_distributed:
         train_sampler = DistributedSampler(train_dataset)
         actual_prefetch_factor = getattr(data_loader_manager, 'prefetch_factor', 2)
@@ -861,7 +935,7 @@ def main():
             sampler=train_sampler,
             shuffle=False,
             num_workers=data_loader_manager.num_workers,
-            collate_fn=collate_multimodal_batch,
+            collate_fn=collate_fn,
             pin_memory=True,
             prefetch_factor=actual_prefetch_factor,
             persistent_workers=True if data_loader_manager.num_workers > 0 else False
@@ -873,7 +947,7 @@ def main():
     val_loader = None
     val_sampler = None
     if val_data_list:
-        val_dataset = data_loader_manager.create_dataset(val_data_list)
+        val_dataset = data_loader_manager.create_dataset(val_data_list, is_train=False)
         if is_distributed:
             val_sampler = DistributedSampler(val_dataset, shuffle=False)
             actual_prefetch_factor = getattr(data_loader_manager, 'prefetch_factor', 2)
@@ -885,7 +959,7 @@ def main():
                 sampler=val_sampler,
                 shuffle=False,
                 num_workers=data_loader_manager.num_workers,
-                collate_fn=collate_multimodal_batch,
+                collate_fn=collate_fn,
                 pin_memory=True,
                 prefetch_factor=actual_prefetch_factor,
                 persistent_workers=True if data_loader_manager.num_workers > 0 else False
