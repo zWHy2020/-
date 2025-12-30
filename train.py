@@ -274,6 +274,12 @@ def train_one_epoch(
             attention_mask = attention_mask.to(device, non_blocking=True) if attention_mask is not None else None
         if image_input is not None:
             image_input = image_input.to(device, non_blocking=True)
+            # 防御：裁剪到合法范围并检查有限性
+            image_input = torch.clamp(image_input, 0.0, 1.0)
+            if not torch.isfinite(image_input).all():
+                logger.warning(f"批次 {batch_idx + 1}: image_input 含 NaN/Inf，跳过 | indices={batch_indices_str}")
+                skipped_loss_nan += 1
+                continue
         if video_input is not None:
             video_input = video_input.to(device, non_blocking=True)
         
@@ -682,7 +688,6 @@ def validate(
         return avg_metrics
 
 
-
 def main():
     parser = argparse.ArgumentParser(description='多模态JSCC训练脚本')
     parser.add_argument('--data-dir', type=str, required=True, help='数据目录')
@@ -695,6 +700,7 @@ def main():
     parser.add_argument('--max-val-samples', type=int, default=None, help='最大验证样本数（None表示使用全部数据）')
     parser.add_argument('--local-rank', type=int, default=None, help='分布式训练的本地进程rank')
     parser.add_argument('--distributed', action='store_true', help='启用分布式训练')
+    parser.add_argument('--use-gradscaler', action='store_true', help='显式启用 GradScaler（默认关闭以避免已知 NaN）')
     args = parser.parse_args()
     
     # 设置随机种子
@@ -893,9 +899,13 @@ def main():
     scheduler = create_scheduler(optimizer, config)
     
     # 创建混合精度训练的scaler（如果启用）
+    config.use_gradscaler = args.use_gradscaler or getattr(config, "use_gradscaler", False)
     scaler = None
-    if config.use_amp and config.device.type == "cuda":
-        logger.info("启用混合精度训练（AMP），GradScaler 暂时禁用以排查 NaN。")
+    if config.use_amp and config.device.type == "cuda" and config.use_gradscaler:
+        scaler = torch.amp.GradScaler('cuda')
+        logger.info("启用混合精度训练（AMP）并使用 GradScaler（可能存在已知 NaN 风险）。")
+    elif config.use_amp and config.device.type == "cuda":
+        logger.info("启用混合精度训练（AMP），默认禁用 GradScaler 以避免已知 NaN。")
     elif config.use_amp:
         logger.warning("检测到非CUDA设备，已禁用混合精度训练（AMP）。")
     
