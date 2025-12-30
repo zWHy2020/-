@@ -1287,16 +1287,10 @@ class ImageJSCCDecoder(nn.Module):
                 # 使用统一的语义对齐层
                 aligned_semantic = self.semantic_aligner(ctx)  # [B_semantic, T_text, C]
                 
-                # 【修复】确保semantic_context的batch_size与当前batch_size匹配
-                if aligned_semantic.shape[0] == 1 and batch_size > 1:
-                    aligned_semantic = aligned_semantic.expand(batch_size, -1, -1)  # [B, T_text, C]
-                elif aligned_semantic.shape[0] != batch_size:
-                    if aligned_semantic.shape[0] < batch_size:
-                        repeat_times = batch_size - aligned_semantic.shape[0]
-                        last_sample = aligned_semantic[-1:].expand(repeat_times, -1, -1)
-                        aligned_semantic = torch.cat([aligned_semantic, last_sample], dim=0)
-                    else:
-                        aligned_semantic = aligned_semantic[:batch_size]
+                if aligned_semantic.shape[0] != batch_size:
+                    raise RuntimeError(
+                        f"semantic_context batch mismatch in ImageJSCCDecoder: semantic_batch={aligned_semantic.shape[0]}, expected={batch_size}"
+                    )
                 
                 # 融合 (图像特征为Q, 文本为K/V)
                 semantic_fused = self.semantic_fusion(query=x, guide_vector=aligned_semantic)

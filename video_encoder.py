@@ -787,6 +787,7 @@ class VideoJSCCDecoder(nn.Module):
         
         # 初始化隐藏状态
         self.hidden_state = None
+        self.last_semantic_gate_stats: Dict[str, Optional[float]] = {"mean": None, "std": None}
     
     def forward(
         self,
@@ -1057,28 +1058,23 @@ class VideoJSCCDecoder(nn.Module):
         else:
             aligned_semantic = semantic_context
         
-        # 【修复】确保semantic_context的batch_size与当前batch_size匹配
-        # 如果semantic_context的batch_size为1，需要扩展到当前batch_size
-        if aligned_semantic.shape[0] == 1 and B > 1:
-            aligned_semantic = aligned_semantic.expand(B, -1, -1)  # [B, seq_len, hidden_dim]
-        elif aligned_semantic.shape[0] != B:
-            # 如果batch_size不匹配且不是1，需要复制或截断
-            if aligned_semantic.shape[0] < B:
-                # 重复最后一个样本
-                repeat_times = B - aligned_semantic.shape[0]
-                last_sample = aligned_semantic[-1:].expand(repeat_times, -1, -1)
-                aligned_semantic = torch.cat([aligned_semantic, last_sample], dim=0)
-            else:
-                # 截断到batch_size
-                aligned_semantic = aligned_semantic[:B]
+        if aligned_semantic.shape[0] != B:
+            raise RuntimeError(
+                f"semantic_context batch mismatch: semantic_batch={aligned_semantic.shape[0]}, expected={B}. "
+                "请检查 DataLoader/Collate 的 batch 对齐。"
+            )
         
         # 【修复】使用标准CrossAttention模块（与ImageJSCCDecoder保持一致）
         # CrossAttention 内部会处理 Query 和 Key/Value 序列长度不同的情况
         # 视频特征作为Query，语义上下文作为Key和Value
-        enhanced_video_seq = self.cross_attention(
+        enhanced_video_seq, attn_weights = self.cross_attention(
             query=video_seq,  # [B, H*W, hidden_dim]
-            guide_vector=aligned_semantic  # [B, seq_len, hidden_dim]
+            guide_vector=aligned_semantic,  # [B, seq_len, hidden_dim]
+            return_attention=True
         )
+        if attn_weights is not None:
+            self.last_semantic_gate_stats["mean"] = float(attn_weights.mean().item())
+            self.last_semantic_gate_stats["std"] = float(attn_weights.std().item())
         
         # 残差连接
         enhanced_video_seq = video_seq + enhanced_video_seq

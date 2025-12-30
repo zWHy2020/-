@@ -101,7 +101,12 @@ class EvaluationDataset(Dataset):
     def _load_text(self, text_info: dict):
         """加载文本数据（与 MultimodalDataset 相同）"""
         try:
-            if 'file' in text_info:
+            if 'texts' in text_info:
+                texts = text_info['texts']
+                if not texts:
+                    raise ValueError("text.texts 为空")
+                text = texts[0]
+            elif 'file' in text_info:
                 text_path = os.path.join(self.data_dir, text_info['file'])
                 with open(text_path, 'r', encoding='utf-8') as f:
                     text = f.read().strip()
@@ -127,12 +132,16 @@ class EvaluationDataset(Dataset):
     def _load_image(self, image_info: dict):
         """加载图像数据（不使用 Resize，保持原始尺寸）"""
         try:
-            if 'file' in image_info:
-                image_path = os.path.join(self.data_dir, image_info['file'])
-                image = Image.open(image_path).convert('RGB')
+            if 'files' in image_info:
+                image_path = image_info['files'][0]
+            elif 'file' in image_info:
+                image_path = image_info['file']
             else:
                 image_array = image_info['array']
                 image = Image.fromarray(image_array).convert('RGB')
+                return self.image_transform(image)
+            image_path_full = os.path.join(self.data_dir, image_path)
+            image = Image.open(image_path_full).convert('RGB')
             
             # 只进行 ToTensor 和 Normalize，不进行 Resize
             image_tensor = self.image_transform(image)
@@ -142,21 +151,52 @@ class EvaluationDataset(Dataset):
             return None
     
     def _load_video(self, video_info: dict):
-        """加载视频数据（不使用 Resize）"""
+        """加载视频数据（不使用 Resize），支持 v2/v1"""
         try:
+            video_path = video_info.get("file")
+            if not video_path:
+                raise FileNotFoundError("video.file 缺失")
+            full_path = os.path.join(self.data_dir, video_path)
             import cv2
-            if 'file' in video_info:
-                video_path = os.path.join(self.data_dir, video_info['file'])
-                frames = self._extract_frames_from_video(video_path)
-            else:
-                frames = video_info['frames']
-            
-            if len(frames) > self.max_video_frames:
-                indices = np.linspace(0, len(frames) - 1, self.max_video_frames, dtype=int)
-                frames = [frames[i] for i in indices]
-            
-            video_tensor = torch.stack([self.video_transform(frame) for frame in frames])
-            return video_tensor
+            cap = cv2.VideoCapture(full_path)
+            if not cap.isOpened():
+                raise FileNotFoundError(f"无法打开视频: {full_path}")
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames <= 0:
+                total_frames = 0
+                while True:
+                    ret, _ = cap.read()
+                    if not ret:
+                        break
+                    total_frames += 1
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            sample_count = min(total_frames, self.max_video_frames)
+            indices = (
+                np.linspace(0, total_frames - 1, num=sample_count, dtype=int).tolist()
+                if total_frames > 0
+                else [0] * self.max_video_frames
+            )
+            frames: List[Image.Image] = []
+            current_idx = 0
+            target_ptr = 0
+            while target_ptr < len(indices):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if current_idx == indices[target_ptr]:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frames.append(Image.fromarray(frame_rgb))
+                    target_ptr += 1
+                current_idx += 1
+            cap.release()
+            if not frames:
+                raise RuntimeError(f"未能读取任何帧: {full_path}")
+            while len(frames) < self.max_video_frames:
+                frames.append(frames[-1].copy())
+            video_tensor = torch.stack([self.video_transform(frame) for frame in frames[: self.max_video_frames]])
+            frame_mask = torch.zeros(self.max_video_frames, dtype=torch.float32)
+            frame_mask[: min(sample_count, self.max_video_frames)] = 1.0
+            return {"video": video_tensor, "video_frame_mask": frame_mask}
         except Exception as e:
             print(f"加载视频数据时出错: {e}")
             return None
@@ -263,19 +303,33 @@ def collate_evaluation_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         
         elif modality == 'video':
             # 视频数据：可以堆叠（假设帧数相同）
-            videos = torch.stack(modality_data)
+            videos = []
+            masks = []
+            for item in modality_data:
+                if isinstance(item, dict):
+                    videos.append(item["video"])
+                    masks.append(item.get("video_frame_mask", torch.ones(item["video"].shape[0])))
+                else:
+                    videos.append(item)
+                    masks.append(torch.ones(item.shape[0]))
+            videos = torch.stack(videos)
+            masks = torch.stack(masks)
             full_batch_videos = []
+            full_batch_masks = []
             
             for i in range(len(batch)):
                 if i in valid_samples:
                     idx = valid_samples.index(i)
                     full_batch_videos.append(videos[idx])
+                    full_batch_masks.append(masks[idx])
                 else:
                     zero_video = torch.zeros_like(videos[0])
                     full_batch_videos.append(zero_video)
+                    full_batch_masks.append(torch.zeros_like(masks[0]))
             
             inputs['video_input'] = torch.stack(full_batch_videos)
             targets['video'] = inputs['video_input']
+            inputs['video_frame_mask'] = torch.stack(full_batch_masks)
     
     # 构建最终批次
     batch_data = {
@@ -743,10 +797,17 @@ def main():
     if args.test_manifest:
         config.test_manifest = os.path.join(config.data_dir, args.test_manifest)
     else:
-        config.test_manifest = os.path.join(config.data_dir, 'test_manifest.json')
-        # 如果没有test_manifest，尝试使用val_manifest
-        if not os.path.exists(config.test_manifest):
-            config.test_manifest = os.path.join(config.data_dir, 'val_manifest.json')
+        default_test_v2 = os.path.join(config.data_dir, "test_manifest_v2.json")
+        default_val_v2 = os.path.join(config.data_dir, "val_manifest_v2.json")
+        if os.path.exists(default_test_v2):
+            config.test_manifest = default_test_v2
+        elif os.path.exists(default_val_v2):
+            config.test_manifest = default_val_v2
+        else:
+            config.test_manifest = os.path.join(config.data_dir, 'test_manifest.json')
+            # 如果没有test_manifest，尝试使用val_manifest
+            if not os.path.exists(config.test_manifest):
+                config.test_manifest = os.path.join(config.data_dir, 'val_manifest.json')
     
     if args.batch_size:
         config.batch_size = args.batch_size

@@ -1,237 +1,328 @@
 """
-多模态数据加载器
+多模态数据加载器（支持 Manifest v1/v2，严格模式）
 
-支持文本、图像、视频数据的统一加载和预处理。
+关键特性：
+- Manifest v2：每视频一条记录，text/texts 与 image/files 列表
+- 训练随机采样 caption/keyframe，验证固定 captions[0]/keyframes[0]
+- 视频按需抽帧（不读取全量帧），短视频 repeat-last + mask
+- 严格模式默认开启：关键模态缺失会丢弃样本并统计；可选 allow_missing_modalities 走零填充调试
 """
 
-import torch
-from torch.utils.data import Dataset, DataLoader
-from typing import Dict, List, Any, Optional, Tuple, Union
-import numpy as np
-from PIL import Image
-import cv2
+from __future__ import annotations
+
 import json
 import os
+import random
+import warnings
+from functools import partial
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 
+def _default_image_transform(image_size: Tuple[int, int]) -> transforms.Compose:
+    return transforms.Compose(
+        [
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+        ]
+    )
+
+
+def _default_video_transform(image_size: Tuple[int, int]) -> transforms.Compose:
+    return transforms.Compose(
+        [
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+        ]
+    )
+
+
+def _load_manifest(manifest: str) -> List[Dict[str, Any]]:
+    with open(manifest, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 class MultimodalDataset(Dataset):
-    """
-    多模态数据集
-    
-    支持文本、图像、视频数据的统一处理。
-    """
-    
+    """支持 v1/v2 manifest 的数据集。"""
+
     def __init__(
         self,
         data_dir: str,
-        data_list: List[Dict[str, Any]],
+        data_list: Sequence[Dict[str, Any]],
         text_tokenizer: Optional[Any] = None,
         image_transform: Optional[transforms.Compose] = None,
         video_transform: Optional[transforms.Compose] = None,
         max_text_length: int = 512,
         max_video_frames: int = 10,
-        image_size: Tuple[int, int] = (224, 224)
+        image_size: Tuple[int, int] = (224, 224),
+        is_train: bool = True,
+        allow_missing_modalities: bool = False,
+        strict_mode: bool = True,
+        required_modalities: Tuple[str, ...] = ("video", "text"),
+        seed: Optional[int] = None,
     ):
         self.data_dir = data_dir
-        self.data_list = data_list
+        self.data_list = list(data_list)
         self.text_tokenizer = text_tokenizer
-        self.image_transform = image_transform
-        self.video_transform = video_transform
+        self.image_transform = image_transform or _default_image_transform(image_size)
+        self.video_transform = video_transform or _default_video_transform(image_size)
         self.max_text_length = max_text_length
         self.max_video_frames = max_video_frames
         self.image_size = image_size
+        self.is_train = is_train
+        self.allow_missing_modalities = allow_missing_modalities
+        self.strict_mode = strict_mode
+        self.required_modalities = required_modalities
         self.text_pad_token_id = (
-            self.text_tokenizer.pad_token_id
-            if self.text_tokenizer is not None and hasattr(self.text_tokenizer, 'pad_token_id')
-            else 0
+            getattr(self.text_tokenizer, "pad_token_id", 0) if self.text_tokenizer is not None else 0
         )
-        
-        # 默认图像变换
-        if self.image_transform is None:
-            self.image_transform = transforms.Compose([
-                transforms.Resize(image_size),
-                transforms.ToTensor()
-            ])
-        
-        # 默认视频变换
-        if self.video_transform is None:
-            self.video_transform = transforms.Compose([
-                transforms.Resize(image_size),
-                transforms.ToTensor(),
-                
-            ])
-    
+        self.drop_count = 0
+        self.missing_counts: Dict[str, int] = {"text": 0, "image": 0, "video": 0}
+        self.random_state = random.Random(seed)
+        self.version = "v2" if any("texts" in item.get("text", {}) for item in self.data_list) else "v1"
+        if self.version == "v1":
+            warnings.warn("检测到 manifest v1：会导致重复解码与语义错配，建议迁移到 v2。", UserWarning)
+
     def __len__(self) -> int:
         return len(self.data_list)
-    
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """
-        获取单个样本
-        
-        Args:
-            idx: 样本索引
-            
-        Returns:
-            Dict[str, Any]: 样本数据
-        """
-        item = self.data_list[idx]
-        sample = {}
-        
-        # 文本数据
-        if 'text' in item:
-            text_data = self._load_text(item['text'])
-            if text_data is not None:
-                sample['text'] = text_data
-        
-        # 图像数据
-        if 'image' in item:
-            image_data = self._load_image(item['image'])
-            if image_data is not None:
-                sample['image'] = image_data
-        
-        # 视频数据
-        if 'video' in item:
-            video_data = self._load_video(item['video'])
-            if video_data is not None:
-                sample['video'] = video_data
 
-        # 记录样本索引用于诊断
-        sample['sample_index'] = idx
-        
-        return sample
-    
-    def _load_text(self, text_info: Dict[str, Any]) -> Optional[Dict[str, torch.Tensor]]:
-        """
-        加载文本数据
-        
-        Args:
-            text_info: 文本信息
-            
-        Returns:
-            Optional[Dict[str, torch.Tensor]]: 文本数据
-        """
-        try:
-            if 'file' in text_info:
-                # 从文件加载
-                text_path = os.path.join(self.data_dir, text_info['file'])
-                with open(text_path, 'r', encoding='utf-8') as f:
-                    text = f.read().strip()
+    def _select_caption(self, text_info: Dict[str, Any]) -> Tuple[str, int]:
+        if "texts" in text_info:
+            texts = text_info["texts"]
+            if not texts:
+                raise ValueError("text.texts 为空")
+            if self.is_train:
+                idx = self.random_state.randint(0, len(texts) - 1)
             else:
-                # 直接文本
-                text = text_info['text']
-            
-            # 分词
-            if self.text_tokenizer:
-                tokens = self.text_tokenizer.encode(text, max_length=self.max_text_length, truncation=True)
-                input_ids = torch.tensor(tokens['input_ids'], dtype=torch.long)
-                attention_mask = torch.tensor(tokens['attention_mask'], dtype=torch.long)
+                idx = 0
+            return texts[idx], idx
+        text = text_info.get("text", "")
+        return text, 0
+
+    def _select_keyframe(self, image_info: Dict[str, Any]) -> Tuple[str, int]:
+        if "files" in image_info:
+            files = image_info["files"]
+            if not files:
+                raise ValueError("image.files 为空")
+            if self.is_train:
+                idx = self.random_state.randint(0, len(files) - 1)
             else:
-                # 简单的字符级编码
-                input_ids = torch.tensor([ord(c) for c in text[:self.max_text_length]], dtype=torch.long)
-                attention_mask = torch.ones_like(input_ids)
-            
-            return {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'pad_token_id': self.text_pad_token_id
-            }
-        except Exception as e:
-            print(f"加载文本数据时出错: {e}")
-            return None
-    
-    def _load_image(self, image_info: Dict[str, Any]) -> Optional[torch.Tensor]:
-        """
-        加载图像数据
-        
-        Args:
-            image_info: 图像信息
-            
-        Returns:
-            Optional[torch.Tensor]: 图像张量
-        """
-        try:
-            if 'file' in image_info:
-                # 从文件加载
-                image_path = os.path.join(self.data_dir, image_info['file'])
-                image = Image.open(image_path).convert('RGB')
-            else:
-                # 从数组加载
-                image_array = image_info['array']
-                image = Image.fromarray(image_array).convert('RGB')
-            
-            # 应用变换
-            image_tensor = self.image_transform(image)
-            return image_tensor
-        except Exception as e:
-            print(f"加载图像数据时出错: {e}")
-            return None
-    
-    def _load_video(self, video_info: Dict[str, Any]) -> Optional[torch.Tensor]:
-        """
-        加载视频数据
-        
-        Args:
-            video_info: 视频信息
-            
-        Returns:
-            Optional[torch.Tensor]: 视频张量
-        """
-        try:
-            if 'file' in video_info:
-                # 从文件加载
-                video_path = os.path.join(self.data_dir, video_info['file'])
-                frames = self._extract_frames_from_video(video_path)
-            else:
-                # 从数组加载
-                frames = video_info['frames']
-            
-            # 限制帧数
-            if len(frames) > self.max_video_frames:
-                indices = np.linspace(0, len(frames) - 1, self.max_video_frames, dtype=int)
-                frames = [frames[i] for i in indices]
-            
-            # 转换为张量
-            video_tensor = torch.stack([self.video_transform(frame) for frame in frames])
-            return video_tensor
-        except Exception as e:
-            print(f"加载视频数据时出错: {e}")
-            return None
-    
-    def _extract_frames_from_video(self, video_path: str) -> List[Image.Image]:
-        """
-        从视频文件提取帧
-        
-        Args:
-            video_path: 视频文件路径
-            
-        Returns:
-            List[Image.Image]: 帧列表
-        """
-        cap = cv2.VideoCapture(video_path)
-        frames = []
-        
-        while True:
+                idx = 0
+            return files[idx], idx
+        return image_info["file"], 0
+
+    def _tokenize(self, text: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.text_tokenizer:
+            tokens = self.text_tokenizer(
+                text, max_length=self.max_text_length, truncation=True, padding="max_length", return_tensors="pt"
+            )
+            input_ids = tokens["input_ids"].squeeze(0)
+            attention_mask = tokens["attention_mask"].squeeze(0)
+        else:
+            encoded = [ord(c) for c in text[: self.max_text_length]]
+            input_ids = torch.tensor(encoded, dtype=torch.long)
+            pad_len = self.max_text_length - input_ids.shape[0]
+            if pad_len > 0:
+                input_ids = torch.cat(
+                    [input_ids, torch.full((pad_len,), self.text_pad_token_id, dtype=torch.long)], dim=0
+                )
+            attention_mask = torch.zeros_like(input_ids)
+            attention_mask[: len(encoded)] = 1
+        return input_ids, attention_mask
+
+    def _load_image(self, image_path: str) -> torch.Tensor:
+        full_path = os.path.join(self.data_dir, image_path)
+        image = Image.open(full_path).convert("RGB")
+        return self.image_transform(image)
+
+    def _load_video_frames(self, video_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        full_path = os.path.join(self.data_dir, video_path)
+        cap = cv2.VideoCapture(full_path)
+        if not cap.isOpened():
+            raise FileNotFoundError(f"无法打开视频: {full_path}")
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            # CAP_PROP_FRAME_COUNT 可能不可用，顺序计数
+            total_frames = 0
+            while True:
+                ret, _ = cap.read()
+                if not ret:
+                    break
+                total_frames += 1
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        sample_count = min(total_frames, self.max_video_frames)
+        if sample_count <= 0:
+            cap.release()
+            raise RuntimeError(f"视频为空: {full_path}")
+        target_indices = (
+            np.linspace(0, total_frames - 1, num=sample_count, dtype=int).tolist()
+            if total_frames > 1
+            else [0] * sample_count
+        )
+        frames: List[Image.Image] = []
+        current_idx = 0
+        target_ptr = 0
+        while target_ptr < len(target_indices):
             ret, frame = cap.read()
             if not ret:
                 break
-            
-            # 转换BGR到RGB
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_pil = Image.fromarray(frame_rgb)
-            frames.append(frame_pil)
-        
+            if current_idx == target_indices[target_ptr]:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(Image.fromarray(frame_rgb))
+                target_ptr += 1
+            current_idx += 1
         cap.release()
-        return frames
+        if not frames:
+            raise RuntimeError(f"未能读取任何帧: {full_path}")
+        true_frames = len(frames)
+        # repeat-last padding
+        while len(frames) < self.max_video_frames:
+            frames.append(frames[-1].copy())
+        video_tensor = torch.stack([self.video_transform(frame) for frame in frames[: self.max_video_frames]])
+        mask = torch.zeros(self.max_video_frames, dtype=torch.float32)
+        mask[: min(true_frames, self.max_video_frames)] = 1.0
+        return video_tensor, mask
+
+    def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
+        item = self.data_list[idx]
+        sample: Dict[str, Any] = {"meta": {}, "valid": {}}
+        meta = sample["meta"]
+        meta["video_id"] = item.get("meta", {}).get("video_id") or os.path.splitext(os.path.basename(item.get("video", {}).get("file", "")))[0]
+        try:
+            caption, caption_idx = self._select_caption(item.get("text", {}))
+            input_ids, attention_mask = self._tokenize(caption)
+            sample["text"] = input_ids
+            sample["text_attention_mask"] = attention_mask
+            sample["pad_token_id"] = self.text_pad_token_id
+            sample["valid"]["text"] = True
+            meta["caption_idx"] = caption_idx
+        except Exception as exc:
+            self.missing_counts["text"] += 1
+            sample["valid"]["text"] = False
+            if self.strict_mode and "text" in self.required_modalities:
+                self.drop_count += 1
+                sample["_dropped"] = f"text_error: {exc}"
+                return sample
+        try:
+            image_path, keyframe_idx = self._select_keyframe(item.get("image", {}))
+            sample["image"] = self._load_image(image_path)
+            sample["valid"]["image"] = True
+            meta["keyframe_idx"] = keyframe_idx
+        except Exception:
+            self.missing_counts["image"] += 1
+            sample["valid"]["image"] = False
+            if self.strict_mode and "image" in self.required_modalities:
+                self.drop_count += 1
+                sample["_dropped"] = "image_error"
+                return sample
+        try:
+            video_path = item.get("video", {}).get("file")
+            if not video_path:
+                raise FileNotFoundError("video.file 为空")
+            video_tensor, frame_mask = self._load_video_frames(video_path)
+            sample["video"] = video_tensor
+            sample["video_frame_mask"] = frame_mask
+            sample["valid"]["video"] = True
+        except Exception as exc:
+            self.missing_counts["video"] += 1
+            sample["valid"]["video"] = False
+            if self.strict_mode and "video" in self.required_modalities:
+                self.drop_count += 1
+                sample["_dropped"] = f"video_error: {exc}"
+                return sample
+        # 允许缺失模态时的填充
+        if self.allow_missing_modalities and not self.strict_mode:
+            if not sample["valid"].get("image", False):
+                sample["image"] = torch.zeros((3, *self.image_size), dtype=torch.float32)
+            if not sample["valid"].get("video", False):
+                sample["video"] = torch.zeros((self.max_video_frames, 3, *self.image_size), dtype=torch.float32)
+                sample["video_frame_mask"] = torch.zeros(self.max_video_frames, dtype=torch.float32)
+            if not sample["valid"].get("text", False):
+                sample["text"] = torch.full((self.max_text_length,), self.text_pad_token_id, dtype=torch.long)
+                sample["text_attention_mask"] = torch.zeros(self.max_text_length, dtype=torch.long)
+        return sample
+
+
+def _pad_sequence(sequences: List[torch.Tensor], pad_value: int) -> torch.Tensor:
+    max_len = max(seq.shape[0] for seq in sequences)
+    padded = []
+    for seq in sequences:
+        pad_len = max_len - seq.shape[0]
+        if pad_len > 0:
+            seq = torch.cat([seq, torch.full((pad_len,), pad_value, dtype=seq.dtype)], dim=0)
+        padded.append(seq)
+    return torch.stack(padded, dim=0)
+
+
+def collate_multimodal_batch(
+    batch: List[Optional[Dict[str, Any]]],
+    allow_missing_modalities: bool = False,
+    required_modalities: Tuple[str, ...] = ("video", "text"),
+) -> Dict[str, Any]:
+    valid_samples = [b for b in batch if b is not None and not b.get("_dropped")]
+    if not valid_samples:
+        raise RuntimeError("批次内所有样本均被丢弃，请检查数据质量或关闭严格模式。")
+    # 过滤仍缺失关键模态的样本
+    filtered_samples: List[Dict[str, Any]] = []
+    for s in valid_samples:
+        missing_required = [m for m in required_modalities if not s.get("valid", {}).get(m, False)]
+        if missing_required and not allow_missing_modalities:
+            continue
+        filtered_samples.append(s)
+    if not filtered_samples:
+        raise RuntimeError("批次内样本缺失关键模态，且 allow_missing_modalities=False，批次为空。")
+
+    inputs: Dict[str, Any] = {}
+    targets: Dict[str, Any] = {}
+    metas: List[Dict[str, Any]] = [s.get("meta", {}) for s in filtered_samples]
+    valid_flags: Dict[str, List[bool]] = {"text": [], "image": [], "video": []}
+
+    # 文本
+    if all(s.get("text") is not None for s in filtered_samples):
+        text_tensors = [s["text"] for s in filtered_samples]
+        attn_masks = [s["text_attention_mask"] for s in filtered_samples]
+        pad_token = filtered_samples[0].get("pad_token_id", 0)
+        inputs["text_input"] = _pad_sequence(text_tensors, pad_token)
+        inputs["text_attention_mask"] = _pad_sequence(attn_masks, 0)
+        targets["text"] = inputs["text_input"]
+        valid_flags["text"] = [s.get("valid", {}).get("text", False) for s in filtered_samples]
+
+    # 图像
+    if all("image" in s for s in filtered_samples):
+        images = torch.stack([s["image"] for s in filtered_samples])
+        inputs["image_input"] = images
+        targets["image"] = images
+        valid_flags["image"] = [s.get("valid", {}).get("image", False) for s in filtered_samples]
+
+    # 视频
+    if all("video" in s for s in filtered_samples):
+        videos = torch.stack([s["video"] for s in filtered_samples])
+        inputs["video_input"] = videos
+        targets["video"] = videos
+        masks = [s.get("video_frame_mask", torch.ones(videos.shape[1])) for s in filtered_samples]
+        inputs["video_frame_mask"] = torch.stack(masks)
+        valid_flags["video"] = [s.get("valid", {}).get("video", False) for s in filtered_samples]
+
+    batch_data = {
+        "inputs": inputs,
+        "targets": targets,
+        "meta": metas,
+        "valid": valid_flags,
+    }
+    if "text_attention_mask" in inputs:
+        batch_data["attention_mask"] = inputs["text_attention_mask"]
+    return batch_data
 
 
 class MultimodalDataLoader:
-    """
-    多模态数据加载器
-    
-    统一管理文本、图像、视频数据的加载。
-    """
-    
+    """统一的数据加载器封装。"""
+
     def __init__(
         self,
         data_dir: str,
@@ -242,7 +333,11 @@ class MultimodalDataLoader:
         image_size: Tuple[int, int] = (224, 224),
         max_text_length: int = 512,
         max_video_frames: int = 10,
-        prefetch_factor: int = 2
+        prefetch_factor: int = 2,
+        allow_missing_modalities: bool = False,
+        strict_mode: bool = True,
+        required_modalities: Tuple[str, ...] = ("video", "text"),
+        seed: Optional[int] = None,
     ):
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -253,24 +348,23 @@ class MultimodalDataLoader:
         self.max_text_length = max_text_length
         self.max_video_frames = max_video_frames
         self.prefetch_factor = prefetch_factor
-    
+        self.allow_missing_modalities = allow_missing_modalities
+        self.strict_mode = strict_mode
+        self.required_modalities = required_modalities
+        self.seed = seed
+
     def create_dataset(
         self,
-        data_list: List[Dict[str, Any]],
+        data_list_or_manifest: Sequence[Dict[str, Any]] | str,
         image_transform: Optional[transforms.Compose] = None,
-        video_transform: Optional[transforms.Compose] = None
+        video_transform: Optional[transforms.Compose] = None,
+        is_train: bool = True,
     ) -> MultimodalDataset:
-        """
-        创建数据集
-        
-        Args:
-            data_list: 数据列表
-            image_transform: 图像变换
-            video_transform: 视频变换
-            
-        Returns:
-            MultimodalDataset: 数据集
-        """
+        data_list = (
+            _load_manifest(data_list_or_manifest)
+            if isinstance(data_list_or_manifest, str)
+            else list(data_list_or_manifest)
+        )
         return MultimodalDataset(
             data_dir=self.data_dir,
             data_list=data_list,
@@ -279,212 +373,33 @@ class MultimodalDataLoader:
             video_transform=video_transform,
             max_text_length=self.max_text_length,
             max_video_frames=self.max_video_frames,
-            image_size=self.image_size
+            image_size=self.image_size,
+            is_train=is_train,
+            allow_missing_modalities=self.allow_missing_modalities,
+            strict_mode=self.strict_mode,
+            required_modalities=self.required_modalities,
+            seed=self.seed,
         )
-    
+
     def create_dataloader(
         self,
         dataset: MultimodalDataset,
-        shuffle: Optional[bool] = None
+        shuffle: Optional[bool] = None,
     ) -> DataLoader:
-        """
-        创建数据加载器
-        
-        Args:
-            dataset: 数据集
-            shuffle: 是否打乱数据
-            
-        Returns:
-            DataLoader: 数据加载器
-        """
         if shuffle is None:
             shuffle = self.shuffle
-        actual_prefetch_factor = getattr(self, 'prefetch_factor', 2)
-        if self.num_workers == 0:
-            actual_prefetch_factor = None
+        actual_prefetch_factor = None if self.num_workers == 0 else self.prefetch_factor
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
             shuffle=shuffle,
             num_workers=self.num_workers,
-            collate_fn=collate_multimodal_batch,
+            collate_fn=partial(
+                collate_multimodal_batch,
+                allow_missing_modalities=self.allow_missing_modalities,
+                required_modalities=self.required_modalities,
+            ),
             pin_memory=True,
-            prefetch_factor=actual_prefetch_factor,# 预取因子，加速数据加载
-            persistent_workers=True if self.num_workers > 0 else False  # 保持工作进程，避免重复创建
+            prefetch_factor=actual_prefetch_factor,
+            persistent_workers=self.num_workers > 0,
         )
-
-
-def collate_multimodal_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    多模态批次整理函数 - 支持缺失模态的鲁棒处理
-    
-    Args:
-        batch: 批次数据列表
-        
-    Returns:
-        Dict[str, Any]: 整理后的批次数据
-    """
-    # 分离输入和目标
-    inputs = {}
-    targets = {}
-    attention_masks = {}
-    indices = [sample.pop('sample_index', None) for sample in batch]
-    
-    # 收集所有模态的数据
-    modalities = set()
-    for sample in batch:
-        modalities.update(sample.keys())
-    
-    # 处理每个模态
-    for modality in modalities:
-        modality_data = []
-        valid_samples = []
-        index_map = {}
-        
-        # 收集有效样本
-        for i, sample in enumerate(batch):
-            if modality in sample and sample[modality] is not None:
-                index_map[i] = len(modality_data)
-                modality_data.append(sample[modality])
-                valid_samples.append(i)
-        
-        # 如果该模态在所有样本中都缺失，跳过
-        if not modality_data:
-            continue
-        
-        # 根据模态类型处理数据
-        if modality == 'text':
-            # 文本数据
-            input_ids = [item['input_ids'] for item in modality_data]
-            attention_mask = [item['attention_mask'] for item in modality_data]
-            pad_token_id = 0
-            if 'pad_token_id' in modality_data[0] and modality_data[0]['pad_token_id'] is not None:
-                pad_token_id = int(modality_data[0]['pad_token_id'])
-            
-            # 填充到相同长度
-            max_len = max(len(ids) for ids in input_ids)
-            padded_input_ids = []
-            padded_attention_mask = []
-            
-            for ids, mask in zip(input_ids, attention_mask):
-                pad_len = max_len - len(ids)
-                padded_input_ids.append(
-                    torch.cat([ids, torch.full((pad_len,), pad_token_id, dtype=ids.dtype)])
-                )
-                padded_attention_mask.append(torch.cat([mask, torch.zeros(pad_len, dtype=mask.dtype)]))
-            
-            # 为缺失的样本创建零填充
-            full_batch_input_ids = []
-            full_batch_attention_mask = []
-            
-            for i in range(len(batch)):
-                if i in index_map:
-                    idx = index_map[i]
-                    full_batch_input_ids.append(padded_input_ids[idx])
-                    full_batch_attention_mask.append(padded_attention_mask[idx])
-                else:
-                    # 创建零填充
-                    full_batch_input_ids.append(torch.full((max_len,), pad_token_id, dtype=torch.long))
-                    full_batch_attention_mask.append(torch.zeros(max_len, dtype=torch.long))
-            
-            inputs['text_input'] = torch.stack(full_batch_input_ids)
-            inputs['text_attention_mask'] = torch.stack(full_batch_attention_mask)
-            targets['text'] = inputs['text_input']  # 自监督学习
-            
-        elif modality == 'image':
-            # 图像数据
-            images = torch.stack(modality_data)
-            
-            # 为缺失的样本创建零填充
-            full_batch_images = []
-            for i in range(len(batch)):
-                if i in index_map:
-                    idx = index_map[i]
-                    full_batch_images.append(images[idx])
-                else:
-                    # 创建零填充图像
-                    zero_image = torch.zeros_like(images[0])
-                    full_batch_images.append(zero_image)
-            
-            inputs['image_input'] = torch.stack(full_batch_images)
-            targets['image'] = inputs['image_input']  # 自监督学习
-            
-        elif modality == 'video':
-            # 视频数据
-            videos = torch.stack(modality_data)
-            
-            # 为缺失的样本创建零填充
-            full_batch_videos = []
-            for i in range(len(batch)):
-                if i in index_map:
-                    idx = index_map[i]
-                    full_batch_videos.append(videos[idx])
-                else:
-                    # 创建零填充视频
-                    zero_video = torch.zeros_like(videos[0])
-                    full_batch_videos.append(zero_video)
-            
-            inputs['video_input'] = torch.stack(full_batch_videos)
-            targets['video'] = inputs['video_input']  # 自监督学习
-    
-    # 构建最终批次
-    batch_data = {
-        'inputs': inputs,
-        'targets': targets,
-        'indices': indices
-    }
-    # 将文本 attention_mask 直接传到 batch 根上，供损失函数使用
-    if 'text_attention_mask' in inputs:
-        batch_data['attention_mask'] = inputs['text_attention_mask']
-    
-    return batch_data
-
-
-def create_sample_data(
-    num_samples: int = 100,
-    data_dir: str = './sample_data'
-) -> List[Dict[str, Any]]:
-    """
-    创建示例数据
-    
-    Args:
-        num_samples: 样本数量
-        data_dir: 数据目录
-        
-    Returns:
-        List[Dict[str, Any]]: 示例数据列表
-    """
-    os.makedirs(data_dir, exist_ok=True)
-    
-    data_list = []
-    
-    for i in range(num_samples):
-        sample = {}
-        
-        # 文本数据
-        sample['text'] = {
-            'text': f"这是第{i+1}个样本的文本描述。包含农业感知数据的信息。"
-        }
-        
-        # 图像数据
-        image_path = os.path.join(data_dir, f'image_{i}.jpg')
-        # 创建随机图像
-        image_array = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
-        image = Image.fromarray(image_array)
-        image.save(image_path)
-        sample['image'] = {'file': f'image_{i}.jpg'}
-        
-        # 视频数据
-        video_path = os.path.join(data_dir, f'video_{i}.mp4')
-        # 创建随机视频
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(video_path, fourcc, 30.0, (224, 224))
-        for frame_idx in range(30):  # 1秒视频
-            frame = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
-            out.write(frame)
-        out.release()
-        sample['video'] = {'file': f'video_{i}.mp4'}
-        
-        data_list.append(sample)
-    
-    return data_list

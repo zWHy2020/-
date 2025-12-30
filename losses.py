@@ -746,6 +746,8 @@ class MultimodalLoss(nn.Module):
         rate_weight: float = 1e-4,  # 【新增】码率/能量约束权重
         temporal_consistency_weight: float = 0.0,  # 【新增】视频时序一致性正则权重
         discriminator_weight: float = 0.01,  # 【Phase 3】对抗损失权重（默认较小）
+        condition_margin_weight: float = 0.0,
+        condition_margin: float = 0.05,
         
         # 假设数据范围是 [0, 1]
         data_range: float = 1.0,
@@ -761,6 +763,8 @@ class MultimodalLoss(nn.Module):
         self.text_contrastive_weight = text_contrastive_weight
         self.video_text_contrastive_weight = video_text_contrastive_weight
         self.rate_weight = rate_weight
+        self.condition_margin_weight = condition_margin_weight
+        self.condition_margin = condition_margin
         
         # 【Phase 3】对抗训练相关
         self.use_adversarial = use_adversarial
@@ -770,7 +774,7 @@ class MultimodalLoss(nn.Module):
         
         # 初始化各个模态的损失函数
         self.text_loss_fn = TextLoss(
-            use_contrastive=True,
+            use_contrastive=self.text_contrastive_weight > 0,
             contrastive_weight=self.text_contrastive_weight
         )
         self.video_text_contrastive_loss_fn = TextImageContrastiveLoss()
@@ -929,6 +933,24 @@ class MultimodalLoss(nn.Module):
             except Exception as e:
                 print(f"警告: 计算视频-文本对比损失时出错: {e}")
                 loss_dict['video_text_contrastive_loss'] = 0.0
+
+        # --- 条件边际损失 ---
+        if (
+            self.condition_margin_weight > 0
+            and 'video_decoded' in predictions
+            and 'video_decoded_shuffled' in predictions
+            and 'video' in targets
+        ):
+            pred_correct = predictions['video_decoded']
+            pred_shuffled = predictions['video_decoded_shuffled']
+            target_video = targets['video']
+            lc = torch.mean(torch.abs(pred_correct - target_video))
+            ls = torch.mean(torch.abs(pred_shuffled - target_video))
+            condition_penalty = torch.relu(self.condition_margin - (ls - lc))
+            condition_loss = condition_penalty.mean()
+            weighted_condition_loss = self.condition_margin_weight * condition_loss
+            total_loss = weighted_condition_loss if total_loss is None else (total_loss + weighted_condition_loss)
+            loss_dict['condition_margin_loss'] = weighted_condition_loss.item()
 
         # --- 码率/能量约束 ---
         if self.rate_weight > 0 and 'rate_stats' in predictions:
